@@ -316,7 +316,7 @@ pub const SessionManager = struct {
         if (enforce_max_bytes) {
             record_line = std.fmt.allocPrint(
                 self.allocator,
-                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
+                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
                 .{
                     record.ts,
                     std.json.fmt(record.provider, .{}),
@@ -324,6 +324,7 @@ pub const SessionManager = struct {
                     record.usage.prompt_tokens,
                     record.usage.completion_tokens,
                     record.usage.total_tokens,
+                    record.success,
                 },
             ) catch return;
         }
@@ -348,7 +349,7 @@ pub const SessionManager = struct {
             w.writeAll(line) catch return;
         } else {
             w.print(
-                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
+                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
                 .{
                     record.ts,
                     std.json.fmt(record.provider, .{}),
@@ -356,6 +357,7 @@ pub const SessionManager = struct {
                     record.usage.prompt_tokens,
                     record.usage.completion_tokens,
                     record.usage.total_tokens,
+                    record.success,
                 },
             ) catch return;
         }
@@ -780,6 +782,7 @@ test "usage ledger resets when max line limit is reached" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":3") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
 }
 
 test "usage ledger resets when window expires" {
@@ -832,6 +835,7 @@ test "usage ledger resets when window expires" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":11") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
 }
 
 test "usage ledger resets when byte limit would be exceeded" {
@@ -880,6 +884,7 @@ test "usage ledger resets when byte limit would be exceeded" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":22") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
 }
 
 test "getOrCreate creates new session for unknown key" {
