@@ -64,6 +64,15 @@ ls -lh zig-out/bin/nullclaw
 
 ## Quick Start
 
+### 1) Recommended install (Homebrew)
+
+```bash
+brew install nullclaw
+nullclaw --help
+```
+
+### 2) Build from source
+
 > **Prerequisite:** use **Zig 0.15.2** (exact version).
 > `0.16.0-dev` and other Zig versions are currently unsupported and may fail to build.
 > Verify before building: `zig version` should print `0.15.2`.
@@ -72,73 +81,20 @@ ls -lh zig-out/bin/nullclaw
 git clone https://github.com/nullclaw/nullclaw.git
 cd nullclaw
 zig build -Doptimize=ReleaseSmall
-
 zig build test --summary all
-
-# Quick setup
-zig-out/bin/nullclaw onboard --api-key sk-... --provider openrouter
-
-# Or interactive wizard
-zig-out/bin/nullclaw onboard --interactive
-
-# Chat
-zig-out/bin/nullclaw agent -m "Hello, nullclaw!"
-
-# Interactive mode
-zig-out/bin/nullclaw agent
-
-# Start gateway runtime (gateway + all configured channels/accounts + heartbeat + scheduler)
-zig-out/bin/nullclaw gateway                # default: 127.0.0.1:3000
-zig-out/bin/nullclaw gateway --port 8080    # custom port
-
-# Check status
-zig-out/bin/nullclaw status
-
-# Run system diagnostics
-zig-out/bin/nullclaw doctor
-
-# Check channel health
-zig-out/bin/nullclaw channel status
-
-# Start specific channels
-zig-out/bin/nullclaw channel start telegram
-zig-out/bin/nullclaw channel start discord
-zig-out/bin/nullclaw channel start signal
-
-# Manage background service
-zig-out/bin/nullclaw service install
-zig-out/bin/nullclaw service status
-
-# Migrate memory from OpenClaw
-zig-out/bin/nullclaw migrate openclaw --dry-run
-zig-out/bin/nullclaw migrate openclaw
 ```
 
-### Install `nullclaw` Command (Cross-Platform)
+Make `nullclaw` available on `PATH`:
 
-If you already use Homebrew (macOS/Linux), install into Homebrew's `bin` (usually already on `PATH`):
-
-```bash
-zig build -Doptimize=ReleaseSmall
-mkdir -p "$(brew --prefix)/bin"
-ln -sf "$PWD/zig-out/bin/nullclaw" "$(brew --prefix)/bin/nullclaw"
-nullclaw --help
-```
-
-Otherwise, install into a user prefix (puts binary into `<prefix>/bin`):
+macOS/Linux (zsh/bash):
 
 ```bash
 zig build -Doptimize=ReleaseSmall -p "$HOME/.local"
-```
-
-macOS/Linux (zsh/bash) add to `PATH` once:
-
-```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 # or ~/.bashrc
 ```
 
-Windows (PowerShell) install + add to `PATH` once:
+Windows (PowerShell):
 
 ```powershell
 zig build -Doptimize=ReleaseSmall -p "$HOME\.local"
@@ -151,10 +107,53 @@ if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
 $env:Path = "$env:Path;$bin"
 ```
 
-After that, use:
+Then:
 
 ```bash
 nullclaw --help
+```
+
+### 3) Common commands
+
+```bash
+
+# Quick setup
+nullclaw onboard --api-key sk-... --provider openrouter
+
+# Or interactive wizard
+nullclaw onboard --interactive
+
+# Chat
+nullclaw agent -m "Hello, nullclaw!"
+
+# Interactive mode
+nullclaw agent
+
+# Start gateway runtime (gateway + all configured channels/accounts + heartbeat + scheduler)
+nullclaw gateway                # default: 127.0.0.1:3000
+nullclaw gateway --port 8080    # custom port
+
+# Check status
+nullclaw status
+
+# Run system diagnostics
+nullclaw doctor
+
+# Check channel health
+nullclaw channel status
+
+# Start specific channels
+nullclaw channel start telegram
+nullclaw channel start discord
+nullclaw channel start signal
+
+# Manage background service
+nullclaw service install
+nullclaw service status
+
+# Migrate memory from OpenClaw
+nullclaw migrate openclaw --dry-run
+nullclaw migrate openclaw
 ```
 
 ## Edge MVP (Hybrid Host + WASM Logic)
