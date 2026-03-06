@@ -821,10 +821,13 @@ pub const SlackChannel = struct {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
         try body_list.appendSlice(self.allocator, "{\"channel\":\"");
         try body_list.appendSlice(self.allocator, actual_channel);
         try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
-        try root.json_util.appendJsonString(&body_list, self.allocator, text);
+        try root.json_util.appendJsonString(&body_list, self.allocator, mrkdwn_text);
         if (self.thread_ts) |tts| {
             try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
             try body_list.appendSlice(self.allocator, tts);
@@ -1686,6 +1689,16 @@ test "mrkdwn bullets with bold items" {
 test "slack channel vtable compiles" {
     const vt = SlackChannel.vtable;
     try std.testing.expect(@TypeOf(vt) == root.Channel.VTable);
+}
+
+test "sendMessage converts markdown to mrkdwn before sending" {
+    // Verify that markdownToSlackMrkdwn is applied: **bold** -> *bold*
+    const input = "**hello** world";
+    const converted = try markdownToSlackMrkdwn(std.testing.allocator, input);
+    defer std.testing.allocator.free(converted);
+    try std.testing.expectEqualStrings("*hello* world", converted);
+    // Confirm the raw input is NOT already valid mrkdwn (would be sent as-is without conversion)
+    try std.testing.expect(!std.mem.eql(u8, input, converted));
 }
 
 test "slack channel interface returns slack name" {
