@@ -9,6 +9,79 @@ const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed
 /// Default maximum file size to read (10MB).
 const DEFAULT_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
+/// Common binary file signatures (magic numbers)
+const BinarySignatures = struct {
+    const png = "\x89PNG";
+    const jpg = "\xFF\xD8\xFF";
+    const gif = "GIF87a";
+    const gif89 = "GIF89a";
+    const pdf = "%PDF";
+    const zip = "PK\x03\x04";
+    const rar = "Rar!";
+    const sevenz = "7z\xBC\xAF\x27\x1C";
+    const exe_mz = "MZ";
+    const elf = "\x7FELF";
+    const mp4_ftyp = "ftyp";
+    const webp = "RIFF";
+};
+
+fn isBinaryContent(data: []const u8) bool {
+    if (data.len < 4) return false;
+
+    // Check magic numbers
+    if (std.mem.startsWith(u8, data, BinarySignatures.png)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.jpg)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.gif)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.gif89)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.pdf)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.zip)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.rar)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.sevenz)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.exe_mz)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.elf)) return true;
+    if (std.mem.startsWith(u8, data, BinarySignatures.webp)) return true;
+
+    // MP4: check for "ftyp" at offset 4
+    if (data.len > 8 and std.mem.indexOf(u8, data[4..12], BinarySignatures.mp4_ftyp) != null) return true;
+
+    // Check for null bytes in first 8KB (common binary indicator)
+    const check_len = @min(data.len, 8192);
+    for (data[0..check_len]) |byte| {
+        if (byte == 0) return true;
+    }
+
+    return false;
+}
+
+fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, data, BinarySignatures.png)) return "PNG image";
+    if (std.mem.startsWith(u8, data, BinarySignatures.jpg)) return "JPEG image";
+    if (std.mem.startsWith(u8, data, BinarySignatures.gif)) return "GIF image";
+    if (std.mem.startsWith(u8, data, BinarySignatures.gif89)) return "GIF image";
+    if (std.mem.startsWith(u8, data, BinarySignatures.pdf)) return "PDF document";
+    if (std.mem.startsWith(u8, data, BinarySignatures.zip)) return "ZIP archive";
+    if (std.mem.startsWith(u8, data, BinarySignatures.rar)) return "RAR archive";
+    if (std.mem.startsWith(u8, data, BinarySignatures.sevenz)) return "7z archive";
+    if (std.mem.startsWith(u8, data, BinarySignatures.exe_mz)) return "Windows executable";
+    if (std.mem.startsWith(u8, data, BinarySignatures.elf)) return "Linux executable";
+    if (std.mem.startsWith(u8, data, BinarySignatures.webp)) return "WebP image";
+    if (data.len > 8 and std.mem.indexOf(u8, data[4..12], BinarySignatures.mp4_ftyp) != null) return "MP4 video";
+
+    // Fallback: use extension
+    const ext = std.fs.path.extension(path);
+    if (std.mem.eql(u8, ext, ".png")) return "PNG image";
+    if (std.mem.eql(u8, ext, ".jpg") or std.mem.eql(u8, ext, ".jpeg")) return "JPEG image";
+    if (std.mem.eql(u8, ext, ".gif")) return "GIF image";
+    if (std.mem.eql(u8, ext, ".webp")) return "WebP image";
+    if (std.mem.eql(u8, ext, ".pdf")) return "PDF document";
+    if (std.mem.eql(u8, ext, ".zip")) return "ZIP archive";
+    if (std.mem.eql(u8, ext, ".mp4")) return "MP4 video";
+    if (std.mem.eql(u8, ext, ".mp3")) return "MP3 audio";
+    if (std.mem.eql(u8, ext, ".wav")) return "WAV audio";
+
+    return "binary file";
+}
+
 /// Read file contents with workspace path scoping.
 pub const FileReadTool = struct {
     workspace_dir: []const u8,
@@ -87,6 +160,18 @@ pub const FileReadTool = struct {
             const msg = try std.fmt.allocPrint(allocator, "Failed to read file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
+
+        // Check if content is binary
+        if (isBinaryContent(contents)) {
+            const file_type = getBinaryFileType(contents, path);
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "[Binary file detected: {s}, size: {d} bytes. Use [IMAGE:path] marker for images, or appropriate tool for other binary files.]",
+                .{ file_type, contents.len },
+            );
+            allocator.free(contents);
+            return ToolResult{ .success = true, .output = msg };
+        }
 
         return ToolResult{ .success = true, .output = contents };
     }
