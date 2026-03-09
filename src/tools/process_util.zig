@@ -375,6 +375,30 @@ test "normalizeCapturedOutputOwned converts invalid UTF-8 to safe text" {
     try std.testing.expect(std.mem.indexOf(u8, normalized, "o") != null);
 }
 
+test "run normalizes invalid stderr before returning" {
+    const allocator = std.testing.allocator;
+    const argv: []const []const u8 = if (comptime builtin.os.tag == .windows)
+        &.{
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4); exit 1",
+        }
+    else
+        &.{ "sh", "-c", "printf '\\200' >&2; exit 1" };
+
+    const result = try run(allocator, argv, .{});
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result.stderr));
+    if (comptime builtin.os.tag == .windows) {
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "中文") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "\xEF\xBF\xBD") != null);
+    }
+}
+
 test "windows gbk fallback decodes to utf8" {
     if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
 
