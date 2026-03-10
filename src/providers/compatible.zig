@@ -39,6 +39,25 @@ fn parseStatusCodeValue(value: std.json.Value) ?u16 {
     };
 }
 
+fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (sliceEqlAsciiFold(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     if (root_obj.get("error")) |err_value| {
         if (err_value == .object) {
@@ -62,13 +81,48 @@ fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     return null;
 }
 
+fn lookupFallbackMessage(root_obj: std.json.ObjectMap) ?[]const u8 {
+    if (root_obj.get("error")) |err_value| {
+        if (err_value == .object) {
+            const err_obj = err_value.object;
+            if (err_obj.get("message")) |message| {
+                if (message == .string) return message.string;
+            }
+        }
+    }
+
+    if (root_obj.get("message")) |message| {
+        if (message == .string) return message.string;
+    }
+
+    return null;
+}
+
+fn isResponsesFallbackMessage(message: []const u8) bool {
+    const trimmed = std.mem.trim(u8, message, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    return sliceEqlAsciiFold(trimmed, "not found") or
+        sliceEqlAsciiFold(trimmed, "404 not found") or
+        containsAsciiFold(trimmed, "unknown endpoint") or
+        containsAsciiFold(trimmed, "endpoint not found") or
+        containsAsciiFold(trimmed, "/chat/completions");
+}
+
 fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
 
+    if (error_classify.classifyKnownApiError(parsed.value.object)) |kind| {
+        if (kind != .other) return false;
+    }
+
     const status = lookupFallbackStatusCode(parsed.value.object) orelse return false;
-    return status == 404;
+    if (status != 404) return false;
+
+    const message = lookupFallbackMessage(parsed.value.object) orelse return false;
+    return isResponsesFallbackMessage(message);
 }
 
 /// How the provider expects the API key to be sent.
@@ -1607,6 +1661,8 @@ test "responsesUrl non-v1 api path uses raw suffix" {
 test "shouldFallbackToResponses only for explicit 404 payloads" {
     try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"Not found\",\"code\":404}}"));
     try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"message\":\"unknown endpoint\"}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"No endpoints found that support image input\",\"code\":404}}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"model not found\",\"code\":404}}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
