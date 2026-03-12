@@ -16,6 +16,7 @@ pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
 pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
+pub const codex_support = @import("codex_support.zig");
 pub const version = @import("version.zig");
 pub const state = @import("state.zig");
 pub const status = @import("status.zig");
