@@ -688,16 +688,6 @@ pub const DingTalkChannel = struct {
             if (value.len == 0) return error.InvalidTarget;
             return .{ .kind = .conversation, .value = value };
         }
-        if (trim_prefix_ignore_case(trimmed, "direct:")) |rest| {
-            const value = std.mem.trim(u8, rest, " \t\r\n");
-            if (value.len == 0) return error.InvalidTarget;
-            return .{ .kind = .conversation, .value = value };
-        }
-        if (trim_prefix_ignore_case(trimmed, "dm:")) |rest| {
-            const value = std.mem.trim(u8, rest, " \t\r\n");
-            if (value.len == 0) return error.InvalidTarget;
-            return .{ .kind = .conversation, .value = value };
-        }
         if (trim_prefix_ignore_case(trimmed, "union:")) |rest| {
             const value = std.mem.trim(u8, rest, " \t\r\n");
             if (value.len == 0) return error.InvalidTarget;
@@ -713,6 +703,17 @@ pub const DingTalkChannel = struct {
             return .{ .kind = .conversation, .value = trimmed };
         }
         return error.InvalidTarget;
+    }
+
+    fn proactiveFallbackTarget(target: SessionReplyTarget) ?ProactiveTarget {
+        if (!target.is_group) return null;
+        if (target.conversation_id) |conversation_id| {
+            return .{
+                .kind = .conversation,
+                .value = conversation_id,
+            };
+        }
+        return null;
     }
 
     fn isSenderAllowed(self: *const DingTalkChannel, sender_id: []const u8, sender_staff_id: []const u8) bool {
@@ -1051,11 +1052,8 @@ pub const DingTalkChannel = struct {
                 owned_reply_target.deinit(self.allocator);
             }
 
-            if (reply_target.conversation_id) |conversation_id| {
-                return try self.prepareAiInteraction(.{
-                    .kind = .conversation,
-                    .value = conversation_id,
-                });
+            if (proactiveFallbackTarget(reply_target)) |proactive_target| {
+                return try self.prepareAiInteraction(proactive_target);
             }
             return null;
         }
@@ -1485,11 +1483,8 @@ pub const DingTalkChannel = struct {
             }
 
             if (reply_target.expires_at_ms > 0 and std.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
-                if (reply_target.conversation_id) |conversation_id| {
-                    return self.sendViaAiInteraction(.{
-                        .kind = .conversation,
-                        .value = conversation_id,
-                    }, text);
+                if (proactiveFallbackTarget(reply_target)) |proactive_target| {
+                    return self.sendViaAiInteraction(proactive_target, text);
                 }
                 return error.TargetExpired;
             }
@@ -1497,13 +1492,7 @@ pub const DingTalkChannel = struct {
             return self.sendViaSessionWebhook(reply_target, text);
         }
 
-        if (std.mem.startsWith(u8, trimmed_target, "https://")) {
-            var webhook_target = SessionReplyTarget{
-                .webhook_url = try self.allocator.dupe(u8, trimmed_target),
-            };
-            defer webhook_target.deinit(self.allocator);
-            return self.sendViaSessionWebhook(webhook_target, text);
-        }
+        if (std.mem.startsWith(u8, trimmed_target, "https://")) return error.InvalidTarget;
 
         const proactive_target = try self.parseProactiveTarget(trimmed_target);
         try self.sendViaAiInteraction(proactive_target, text);
@@ -1717,10 +1706,6 @@ test "parseProactiveTarget accepts account-qualified conversation and union targ
     try std.testing.expectEqual(ProactiveTargetKind.conversation, conversation.kind);
     try std.testing.expectEqualStrings("cid-1", conversation.value);
 
-    const direct = try channel.parseProactiveTarget("dm:cid-2");
-    try std.testing.expectEqual(ProactiveTargetKind.conversation, direct.kind);
-    try std.testing.expectEqualStrings("cid-2", direct.value);
-
     const union_id = try channel.parseProactiveTarget("union:user-1");
     try std.testing.expectEqual(ProactiveTargetKind.union_id, union_id.kind);
     try std.testing.expectEqualStrings("user-1", union_id.value);
@@ -1734,6 +1719,14 @@ test "parseProactiveTarget rejects mismatched account prefix" {
         error.InvalidTarget,
         channel.parseProactiveTarget("dingtalk:other:group:cid-1"),
     );
+}
+
+test "parseProactiveTarget rejects direct conversation ids" {
+    var channel = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
+    defer channel.clearEphemeralState();
+
+    try std.testing.expectError(error.InvalidTarget, channel.parseProactiveTarget("direct:cid-1"));
+    try std.testing.expectError(error.InvalidTarget, channel.parseProactiveTarget("dm:cid-1"));
 }
 
 test "parseCallbackPayload accepts sender_staff_id allowlist and rich text" {
@@ -1891,12 +1884,23 @@ test "sendMessage falls back to ai interaction when cached reply target expired 
     var target = SessionReplyTarget{
         .webhook_url = try std.testing.allocator.dupe(u8, "https://oapi.dingtalk.com/robot/sendBySession?session=abc"),
         .conversation_id = try std.testing.allocator.dupe(u8, "cid-1"),
+        .is_group = true,
         .expires_at_ms = 1,
     };
     defer target.deinit(std.testing.allocator);
 
     try channel.reply_targets.put(std.testing.allocator, "dingtalk:default:reply:msg-1", target);
     try channel.sendMessage("dingtalk:default:reply:msg-1", "oi", &.{});
+}
+
+test "sendMessage rejects arbitrary webhook target" {
+    var channel = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
+    defer channel.clearEphemeralState();
+
+    try std.testing.expectError(
+        error.InvalidTarget,
+        channel.sendMessage("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "oi", &.{}),
+    );
 }
 
 test "sendMessage accepts proactive union id target" {
@@ -1910,9 +1914,15 @@ test "sendMessage rejects media attachments" {
     var channel = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
     defer channel.clearEphemeralState();
 
+    var target = SessionReplyTarget{
+        .webhook_url = try std.testing.allocator.dupe(u8, "https://oapi.dingtalk.com/robot/sendBySession?session=abc"),
+    };
+    defer target.deinit(std.testing.allocator);
+    try channel.reply_targets.put(std.testing.allocator, "dingtalk:default:reply:msg-1", target);
+
     try std.testing.expectError(
         error.NotSupported,
-        channel.sendMessage("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "oi", &.{"./file.png"}),
+        channel.sendMessage("dingtalk:default:reply:msg-1", "oi", &.{"./file.png"}),
     );
 }
 
@@ -1925,6 +1935,7 @@ test "sendEventMessage chunk accumulates streaming session for reply target" {
     var target = SessionReplyTarget{
         .webhook_url = try std.testing.allocator.dupe(u8, "https://oapi.dingtalk.com/robot/sendBySession?session=abc"),
         .conversation_id = try std.testing.allocator.dupe(u8, "cid-1"),
+        .is_group = true,
     };
     defer target.deinit(std.testing.allocator);
 
@@ -1963,8 +1974,14 @@ test "sendEventMessage without streaming config ignores chunks and safely finali
     var channel = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
     defer channel.clearEphemeralState();
 
-    try channel.channel().sendEvent("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "ola", &.{}, .chunk);
-    try channel.channel().sendEvent("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "ola final", &.{}, .final);
+    var target = SessionReplyTarget{
+        .webhook_url = try std.testing.allocator.dupe(u8, "https://oapi.dingtalk.com/robot/sendBySession?session=abc"),
+    };
+    defer target.deinit(std.testing.allocator);
+    try channel.reply_targets.put(std.testing.allocator, "dingtalk:default:reply:msg-1", target);
+
+    try channel.channel().sendEvent("dingtalk:default:reply:msg-1", "ola", &.{}, .chunk);
+    try channel.channel().sendEvent("dingtalk:default:reply:msg-1", "ola final", &.{}, .final);
 
     channel.stream_mu.lock();
     defer channel.stream_mu.unlock();
@@ -1977,20 +1994,29 @@ test "sendEventMessage final on nonexistent stream falls back safely" {
     channel.ai_card_streaming_key = "contentStreamingKey";
     defer channel.clearEphemeralState();
 
-    try channel.channel().sendEvent("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "ola final", &.{}, .final);
+    try channel.channel().sendEvent("group:cid-1", "ola final", &.{}, .final);
 
     channel.stream_mu.lock();
     defer channel.stream_mu.unlock();
     try std.testing.expectEqual(@as(usize, 0), channel.stream_sessions.count());
 }
 
-test "sendEventMessage raw webhook target cannot open streaming session" {
+test "sendEventMessage direct reply target cannot open streaming session" {
     var channel = DingTalkChannel.init(std.testing.allocator, "cid", "secret", &.{"*"});
     channel.ai_card_template_id = "tmpl.schema";
     channel.ai_card_streaming_key = "contentStreamingKey";
     defer channel.clearEphemeralState();
 
-    try channel.channel().sendEvent("https://oapi.dingtalk.com/robot/sendBySession?session=abc", "ola", &.{}, .chunk);
+    var target = SessionReplyTarget{
+        .webhook_url = try std.testing.allocator.dupe(u8, "https://oapi.dingtalk.com/robot/sendBySession?session=abc"),
+        .sender_staff_id = try std.testing.allocator.dupe(u8, "staff-42"),
+        .conversation_id = try std.testing.allocator.dupe(u8, "cid-direct-1"),
+        .is_group = false,
+    };
+    defer target.deinit(std.testing.allocator);
+    try channel.reply_targets.put(std.testing.allocator, "dingtalk:default:reply:msg-1", target);
+
+    try channel.channel().sendEvent("dingtalk:default:reply:msg-1", "ola", &.{}, .chunk);
 
     channel.stream_mu.lock();
     defer channel.stream_mu.unlock();
