@@ -104,10 +104,10 @@ build.zig.zon:2:14: error: expected string literal
 
 ## 从别的机器交叉编译 Android 二进制
 
-如果你是在另一台机器上为 Android / Termux 设备构建：
+如果你是在另一台机器上为 Android / Termux 设备构建，除了 Zig target，还需要提供 Android 的 libc/sysroot 文件；只传 `-Dtarget` 还不够：
 
 ```bash
-zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path/to/android-libc-aarch64.txt
 ```
 
 常见目标：
@@ -116,7 +116,7 @@ zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
 - `arm-linux-androideabi.24` 搭配 `-Dcpu=baseline+v7a`
 - `x86_64-linux-android.24`
 
-按设备架构选择目标即可。
+按设备架构选择目标即可。完整的 `--libc` 文件生成示例可参考 [`.github/workflows/release.yml`](../../.github/workflows/release.yml)。
 
 ## 实用建议
 

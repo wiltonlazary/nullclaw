@@ -112,10 +112,10 @@ Start with foreground runs before trying wrappers, launchers, or background auto
 
 ## Cross-Compiling for Android
 
-If you are building on another machine for a Termux / Android device:
+If you are building on another machine for a Termux / Android device, you need both the Zig target and an Android libc/sysroot file:
 
 ```bash
-zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall
+zig build -Dtarget=aarch64-linux-android.24 -Doptimize=ReleaseSmall --libc /path/to/android-libc-aarch64.txt
 ```
 
 Common targets:
@@ -125,6 +125,7 @@ Common targets:
 - `x86_64-linux-android.24`
 
 Use the target that matches the device architecture.
+For a complete example of generating the `--libc` file from the Android NDK, see [`.github/workflows/release.yml`](../../.github/workflows/release.yml).
 
 ## Practical Advice
 

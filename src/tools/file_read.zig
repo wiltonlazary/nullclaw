@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -62,7 +63,7 @@ fn hasIsoBmffHeader(data: []const u8) bool {
     return data.len >= 8 and std.mem.eql(u8, data[4..8], "ftyp");
 }
 
-fn isBinaryContent(data: []const u8) bool {
+pub fn isBinaryContent(data: []const u8) bool {
     if (data.len == 0) return false;
 
     for (BINARY_SIGNATURES) |sig| {
@@ -80,7 +81,7 @@ fn isBinaryContent(data: []const u8) bool {
     return false;
 }
 
-fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
+pub fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
     for (BINARY_SIGNATURES) |sig| {
         if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
     }
@@ -157,7 +158,7 @@ pub const FileReadTool = struct {
         };
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const max_usize_u64: u64 = @intCast(std.math.maxInt(usize));
         const effective_max_file_size = @min(self.max_file_size, max_usize_u64);
         if (stat.size > effective_max_file_size) {

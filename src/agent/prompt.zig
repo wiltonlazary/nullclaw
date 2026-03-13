@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
@@ -87,7 +88,7 @@ fn openWorkspaceFileWithGuards(
         },
     };
 
-    const stat = file.stat() catch {
+    const stat = fs_compat.stat(file) catch {
         file.close();
         allocator.free(canonical_path);
         return null;
@@ -105,13 +106,37 @@ fn openWorkspaceFileWithGuards(
     };
 }
 
-/// Conversation context for the current turn (Signal-specific for now).
+/// Conversation context for the current turn.
+/// Carries per-message sender metadata so the LLM always knows who is talking.
 pub const ConversationContext = struct {
     channel: ?[]const u8 = null,
+    // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    // Discord
+    sender_id: ?[]const u8 = null,
+    sender_username: ?[]const u8 = null,
+    sender_display_name: ?[]const u8 = null,
+    // Shared
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
+
+    /// Compute a hash fingerprint of sender-identifying fields so the system
+    /// prompt can be rebuilt when the *sender* changes, not just when context
+    /// goes from null ↔ non-null.
+    pub fn senderFingerprint(self: ConversationContext) u64 {
+        var h = std.hash.Wyhash.init(0x1234_5678);
+        // Hash each sender-identifying field (or a sentinel null byte).
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_username, self.sender_display_name }) |field| {
+            if (field) |v| {
+                h.update(v);
+            } else {
+                h.update(&.{0});
+            }
+            h.update(&.{0xff}); // field separator
+        }
+        return h.final();
+    }
 };
 
 /// Context passed to prompt sections during construction.
@@ -222,6 +247,16 @@ pub fn buildSystemPrompt(
         }
         if (cc.sender_uuid) |uuid| {
             try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        }
+        // Discord sender fields
+        if (cc.sender_id) |sid| {
+            try std.fmt.format(w, "- Sender Discord ID: {s}\n", .{sid});
+        }
+        if (cc.sender_username) |uname| {
+            try std.fmt.format(w, "- Sender username: {s}\n", .{uname});
+        }
+        if (cc.sender_display_name) |dname| {
+            try std.fmt.format(w, "- Sender display name: {s}\n", .{dname});
         }
         try w.writeAll("\n");
     }
@@ -485,6 +520,10 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("1. ONLY use the format above. NEVER use <invoke>, <function>, or other XML-like formats.\n");
     try w.writeAll("2. Output actual tags -- never describe steps or give examples.\n");
     try w.writeAll("3. The internal content MUST be valid JSON. No trailing commas, no unquoted keys.\n\n");
+    try w.writeAll("CODING GUIDANCE:\n");
+    try w.writeAll("- When reading or editing source code, PREFER the Hashline tool suite (`file_read_hashed` and `file_edit_hashed`).\n");
+    try w.writeAll("- Use `file_read_hashed` to obtain stable line tags (L<num>:<hash>) and `file_edit_hashed` to apply changes using those tags.\n");
+    try w.writeAll("- This protocol ensures deterministic verification and prevents errors from indentation or stale file state.\n\n");
     try w.writeAll("You may use multiple tool calls in a single response. ");
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
@@ -532,11 +571,11 @@ fn appendSkillsSection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
+    // Two-source loading: workspace skills + ~/.nullclaw/skills/
     const home_dir = platform.getHomeDir(allocator) catch null;
     defer if (home_dir) |h| allocator.free(h);
     const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        std.fs.path.join(allocator, &.{ h, ".nullclaw" }) catch null
     else
         null;
     defer if (community_base) |cb| allocator.free(cb);
@@ -1004,6 +1043,28 @@ test "buildSystemPrompt includes telegram group marker guidance for telegram gro
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Group Chat Behavior") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[NO_REPLY]") != null);
+}
+
+test "buildSystemPrompt includes discord sender identity fields" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .conversation_context = .{
+            .channel = "discord",
+            .sender_id = "u-42",
+            .sender_username = "discord-user",
+            .sender_display_name = "Discord User",
+            .group_id = "guild-1",
+            .is_group = true,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender Discord ID: u-42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender username: discord-user") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Sender display name: Discord User") != null);
 }
 
 test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {

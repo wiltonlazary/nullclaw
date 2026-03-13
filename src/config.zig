@@ -72,6 +72,7 @@ pub const ChannelsConfig = config_types.ChannelsConfig;
 pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
 pub const GatewayConfig = config_types.GatewayConfig;
+pub const A2aConfig = config_types.A2aConfig;
 pub const ComposioConfig = config_types.ComposioConfig;
 pub const SecretsConfig = config_types.SecretsConfig;
 pub const BrowserComputerUseConfig = config_types.BrowserComputerUseConfig;
@@ -120,6 +121,8 @@ pub const Config = struct {
     model_routes: []const ModelRouteConfig = &.{},
     agents: []const NamedAgentConfig = &.{},
     agent_bindings: []const @import("agent_routing.zig").AgentBinding = &.{},
+    /// Runtime-only flag used by live `/bind` updates.
+    agent_bindings_runtime_owned: bool = false,
     mcp_servers: []const McpServerConfig = &.{},
 
     // Nested sub-configs
@@ -135,6 +138,7 @@ pub const Config = struct {
     memory: MemoryConfig = .{},
     tunnel: TunnelConfig = .{},
     gateway: GatewayConfig = .{},
+    a2a: A2aConfig = .{},
     composio: ComposioConfig = .{},
     secrets: SecretsConfig = .{},
     browser: BrowserConfig = .{},
@@ -746,6 +750,7 @@ pub const Config = struct {
 
         try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
+        try w.print("  \"a2a\": {f},\n", .{std.json.fmt(self.a2a, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
         try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
@@ -3531,7 +3536,7 @@ test "tools.media.audio disabled" {
 test "parse telegram accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "allow_from": ["user1"], "reply_in_private": false, "proxy": "socks5://host:1080", "status_reactions": true, "binding_commands_enabled": false, "topic_commands_enabled": false, "topic_map_command_enabled": false, "commands_menu_mode": "scoped", "reaction_emojis": {"accepted": "🟡", "running": "🔵", "done": "🟢", "failed": "🔴"}, "interactive": {"enabled": true, "ttl_secs": 42, "owner_only": false, "remove_on_click": false}}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3543,6 +3548,15 @@ test "parse telegram accounts" {
     try std.testing.expectEqualStrings("user1", tg.allow_from[0]);
     try std.testing.expect(!tg.reply_in_private);
     try std.testing.expectEqualStrings("socks5://host:1080", tg.proxy.?);
+    try std.testing.expect(tg.status_reactions);
+    try std.testing.expect(!tg.binding_commands_enabled);
+    try std.testing.expect(!tg.topic_commands_enabled);
+    try std.testing.expect(!tg.topic_map_command_enabled);
+    try std.testing.expect(tg.commands_menu_mode == .scoped);
+    try std.testing.expectEqualStrings("🟡", tg.reaction_emojis.accepted);
+    try std.testing.expectEqualStrings("🔵", tg.reaction_emojis.running);
+    try std.testing.expectEqualStrings("🟢", tg.reaction_emojis.done);
+    try std.testing.expectEqualStrings("🔴", tg.reaction_emojis.failed);
     try std.testing.expect(tg.interactive.enabled);
     try std.testing.expectEqual(@as(u64, 42), tg.interactive.ttl_secs);
     try std.testing.expect(!tg.interactive.owner_only);
@@ -3552,6 +3566,10 @@ test "parse telegram accounts" {
     for (tg.allow_from) |u| allocator.free(u);
     allocator.free(tg.allow_from);
     allocator.free(tg.proxy.?);
+    allocator.free(tg.reaction_emojis.accepted);
+    allocator.free(tg.reaction_emojis.running);
+    allocator.free(tg.reaction_emojis.done);
+    allocator.free(tg.reaction_emojis.failed);
     allocator.free(cfg.channels.telegram);
 }
 
@@ -3563,6 +3581,12 @@ test "parse telegram accounts interactive defaults when omitted" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(usize, 1), cfg.channels.telegram.len);
+    try std.testing.expect(!cfg.channels.telegram[0].status_reactions);
+    try std.testing.expect(cfg.channels.telegram[0].binding_commands_enabled);
+    try std.testing.expect(cfg.channels.telegram[0].topic_commands_enabled);
+    try std.testing.expect(cfg.channels.telegram[0].topic_map_command_enabled);
+    try std.testing.expect(cfg.channels.telegram[0].commands_menu_mode == .flat);
+    try std.testing.expectEqualStrings("👀", cfg.channels.telegram[0].reaction_emojis.accepted);
     const tg = cfg.channels.telegram[0];
     try std.testing.expect(!tg.interactive.enabled);
     try std.testing.expectEqual(@as(u64, 900), tg.interactive.ttl_secs);
@@ -3765,7 +3789,7 @@ test "parse lark accounts" {
 test "parse dingtalk accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"]}}}}}
+        \\{"channels": {"dingtalk": {"accounts": {"main": {"client_id": "cid", "client_secret": "csec", "allow_from": ["u1"], "ai_card_template_id": "tmpl.schema", "ai_card_streaming_key": "contentStreamingKey"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3774,9 +3798,13 @@ test "parse dingtalk accounts" {
     try std.testing.expectEqualStrings("main", dc.account_id);
     try std.testing.expectEqualStrings("cid", dc.client_id);
     try std.testing.expectEqualStrings("csec", dc.client_secret);
+    try std.testing.expectEqualStrings("tmpl.schema", dc.ai_card_template_id.?);
+    try std.testing.expectEqualStrings("contentStreamingKey", dc.ai_card_streaming_key.?);
     allocator.free(dc.account_id);
     allocator.free(dc.client_id);
     allocator.free(dc.client_secret);
+    allocator.free(dc.ai_card_template_id.?);
+    allocator.free(dc.ai_card_streaming_key.?);
     for (dc.allow_from) |u| allocator.free(u);
     allocator.free(dc.allow_from);
     allocator.free(cfg.channels.dingtalk);
