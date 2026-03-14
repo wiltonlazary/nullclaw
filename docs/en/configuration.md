@@ -337,6 +337,118 @@ Max notes:
 - `require_mention = true` only affects group chats. Direct messages and `bot_started` deep links still work normally.
 - Max inline buttons are one-shot in nullclaw: after a valid click, the original keyboard is cleared to avoid stale buttons.
 
+### Discord
+
+Discord example:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "default": {
+          "token": "YOUR_DISCORD_BOT_TOKEN",
+          "intents": 37377
+        }
+      }
+    }
+  }
+}
+```
+
+Discord requires MESSAGE CONTENT INTENT enabled in the Discord Developer Portal (Privileged Gateway Intents section). Without this, the bot cannot read message content.
+
+Gateway intents (`intents`) is a bitmask. Default 37377 = GUILDS (1) + GUILD_MESSAGES (512) + MESSAGE_CONTENT (32768) + DIRECT_MESSAGES (4096). Calculate custom intents from https://discord.com/developers/docs/topics/gateway#gateway-intents.
+
+Discord setup flow:
+1. Create application at https://discord.com/developers/applications
+2. Bot section → Add Bot → Reset Token (copy immediately)
+3. Privileged Gateway Intents → Enable MESSAGE CONTENT INTENT → Save
+4. OAuth2 → URL Generator → Scopes: `bot`, `applications.commands`
+5. Bot Permissions: Send Messages, Read Message History, Read Messages/View Channels
+6. Copy URL, open in browser, select server, authorize
+
+Required permissions: Send Messages, Read Message History, Read Messages/View Channels. Optional: Add Reactions, Manage Messages, Embed Links, Attach Files, Use External Emojis, Mention Everyone, Administrator (use with caution).
+
+Multi-bot setup uses `accounts` wrapper. Each `account_id` creates an independent Discord bot connection with separate session state and routing:
+
+```json
+{
+  "channels": {
+    "discord": {
+      "accounts": {
+        "production": {
+          "token": "PRODUCTION_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["ADMIN_USER_ID"]
+        },
+        "testing": {
+          "token": "TESTING_BOT_TOKEN",
+          "intents": 37377,
+          "allow_from": ["DEV_USER_ID"]
+        }
+      }
+    }
+  }
+}
+```
+
+Channel-specific bindings use `peer.kind = "channel"` with Discord channel IDs (enable Developer Mode → right-click channel → Copy ID):
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "coder",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "channel", "id": "CHANNEL_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Direct message bindings use `peer.kind = "direct"` with user IDs:
+
+```json
+{
+  "bindings": [
+    {
+      "agent_id": "personal",
+      "match": {
+        "channel": "discord",
+        "account_id": "default",
+        "peer": {"kind": "direct", "id": "USER_ID_HERE"}
+      }
+    }
+  ]
+}
+```
+
+Parameters:
+- `token` (required) - Bot token from Discord Developer Portal
+- `intents` (default: 37377) - Gateway intents bitmask
+- `allow_bots` (default: false) - Allow messages from other bots
+- `allow_from` (default: []) - Allowed user IDs, empty = deny all, `["*"]` = allow all
+- `require_mention` (default: false) - Require bot mention in guilds to respond
+- `guild_id` (optional) - Restrict bot to specific server
+
+NullClaw splits messages >2000 characters (Discord API limit). Use `tunnel` configuration for HTTPS-required webhooks when running without public IP.
+
+Verification:
+```bash
+nullclaw channel start discord
+nullclaw channel status
+```
+
+Common issues:
+- Bot connects but doesn't respond: MESSAGE CONTENT INTENT not enabled, or bot needs re-invite after enabling intents
+- "Privileged Intents" error: MESSAGE CONTENT INTENT must be enabled in Discord Developer Portal; requires bot verification or <100 servers
+- Bot offline: Check `nullclaw service status`, verify token hasn't been reset
+- No response in guilds: Check `require_mention` setting, verify Read Messages permission
+
 ### `memory`
 
 - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
