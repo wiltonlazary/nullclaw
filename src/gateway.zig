@@ -33,6 +33,7 @@ const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -58,6 +59,22 @@ const GatewayObservedToolEvent = struct {
     tool: []u8,
     success: bool = false,
 };
+
+fn simpleConversationContext(
+    channel: []const u8,
+    account_id: ?[]const u8,
+    peer_id: []const u8,
+    is_group: bool,
+    group_id: ?[]const u8,
+) ConversationContext {
+    return .{
+        .channel = channel,
+        .account_id = account_id,
+        .peer_id = peer_id,
+        .is_group = is_group,
+        .group_id = if (is_group) (group_id orelse peer_id) else null,
+    };
+}
 
 const GatewayTurnToolEvent = struct {
     kind: GatewayObservedToolEventKind,
@@ -2047,7 +2064,14 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
                 const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
-                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "telegram",
+                    tg_account_id,
+                    cid_str,
+                    std.mem.eql(u8, peer_kind, "group"),
+                    if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
+                );
+                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, conversation_context) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, userFacingAgentError(err)) catch {};
                     }
@@ -2186,7 +2210,14 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "whatsapp",
+                    wa_account_id,
+                    wa_peer_id,
+                    wa_is_group,
+                    wa_group_id,
+                );
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -2242,7 +2273,14 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "whatsapp",
+                    wa_account_id,
+                    wa_peer_id,
+                    wa_is_group,
+                    wa_group_id,
+                );
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -2445,7 +2483,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         metadata,
                     );
                 } else if (ctx.session_mgr_opt) |sm| {
-                    const reply: ?[]const u8 = sm.processMessage(session_key, selection.submit_text, null) catch |err| blk: {
+                    const conversation_context: ?ConversationContext = simpleConversationContext(
+                        "slack",
+                        slack_cfg.account_id,
+                        if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                        !interactive_target.is_dm,
+                        if (!interactive_target.is_dm) interactive_target.channel_id else null,
+                    );
+                    const reply: ?[]const u8 = sm.processMessage(session_key, selection.submit_text, conversation_context) catch |err| blk: {
                         var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
                         outbound_ch.sendMessage(selection.target, userFacingAgentError(err)) catch {};
                         break :blk null;
@@ -2579,7 +2624,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         ) catch null;
         _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+        const conversation_context: ?ConversationContext = simpleConversationContext(
+            "slack",
+            slack_cfg.account_id,
+            if (is_dm) sender_id else channel_id,
+            !is_dm,
+            if (!is_dm) channel_id else null,
+        );
+        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;
@@ -2708,7 +2760,14 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                     _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
                 } else if (ctx.session_mgr_opt) |sm| {
-                    const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+                    const conversation_context: ?ConversationContext = simpleConversationContext(
+                        "line",
+                        line_account_id,
+                        line_peer.id,
+                        !std.mem.eql(u8, line_peer.kind, "direct"),
+                        if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
+                    );
+                    const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -2829,7 +2888,14 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             }) catch null;
             _ = publishToBus(eb, ctx.state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
         } else if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, null) catch |err| blk: {
+            const conversation_context: ?ConversationContext = simpleConversationContext(
+                "lark",
+                lark_account_id,
+                msg.sender,
+                msg.is_group,
+                if (msg.is_group) msg.sender else null,
+            );
+            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, conversation_context) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -2931,7 +2997,21 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, null) catch |err| blk: {
+            const meta = inbound.metadata_json;
+            const account_id = if (meta) |json| jsonStringField(json, "account_id") else null;
+            const is_group = if (meta) |json| std.mem.indexOf(u8, json, "\"is_group\":true") != null else false;
+            const group_id = if (meta) |json|
+                (jsonStringField(json, "group_openid") orelse jsonStringField(json, "channel_id"))
+            else
+                null;
+            const conversation_context: ?ConversationContext = simpleConversationContext(
+                "qq",
+                account_id,
+                inbound.sender_id,
+                is_group,
+                group_id,
+            );
+            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, conversation_context) catch |err| blk: {
                 qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -3040,7 +3120,14 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
         if (ctx.session_mgr_opt) |sm| {
             channels.max.setInteractiveOwnerContext(inbound.sender);
             defer channels.max.setInteractiveOwnerContext(null);
-            const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, null) catch |err| blk: {
+            const conversation_context: ?ConversationContext = simpleConversationContext(
+                "max",
+                max_cfg.account_id,
+                peer_id,
+                inbound.is_group,
+                if (inbound.is_group) reply_target else null,
+            );
+            const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, conversation_context) catch |err| blk: {
                 max_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
                 break :blk null;
             };

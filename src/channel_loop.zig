@@ -1816,7 +1816,15 @@ pub fn runMatrixLoop(
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
 
-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context: ?ConversationContext = .{
+                .channel = "matrix",
+                .account_id = mx_ptr.account_id,
+                .peer_id = if (msg.is_group) room_peer_id else msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) room_peer_id else null,
+            };
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 log.err("Matrix agent error: {}", .{err});
                 const err_msg: []const u8 = switch (err) {
                     error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",

@@ -3406,7 +3406,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             defer tg.stopTyping(typing_target) catch {};
 
             tg.setTaskReaction(msg.sender, msg.message_id, .running);
-            const reply = session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+            const conversation_context: ?yc.agent.ConversationContext = .{
+                .channel = "telegram",
+                .account_id = tg.account_id,
+                .peer_id = msg.sender,
+                .is_group = msg.is_group,
+                .group_id = if (msg.is_group) msg.sender else null,
+            };
+            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 std.debug.print("  Agent error: {}\n", .{err});
                 tg.setTaskReaction(msg.sender, msg.message_id, .failed);
                 const err_msg = switch (err) {
