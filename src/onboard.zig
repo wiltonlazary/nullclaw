@@ -60,6 +60,7 @@ const WorkspaceOnboardingState = struct {
 const WORKSPACE_AGENTS_TEMPLATE = @embedFile("workspace_templates/AGENTS.md");
 const WORKSPACE_SOUL_TEMPLATE = @embedFile("workspace_templates/SOUL.md");
 const WORKSPACE_TOOLS_TEMPLATE = @embedFile("workspace_templates/TOOLS.md");
+const WORKSPACE_CONFIG_TEMPLATE = @embedFile("workspace_templates/CONFIG.md");
 const WORKSPACE_IDENTITY_TEMPLATE = @embedFile("workspace_templates/IDENTITY.md");
 const WORKSPACE_USER_TEMPLATE = @embedFile("workspace_templates/USER.md");
 const WORKSPACE_HEARTBEAT_TEMPLATE = @embedFile("workspace_templates/HEARTBEAT.md");
@@ -2491,6 +2492,9 @@ pub fn scaffoldWorkspace(
     // TOOLS.md (tool usage guide — loaded by prompt.zig)
     try storeOrWriteIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate(), bootstrap_provider);
 
+    // CONFIG.md (guide for the fields written by onboarding into config.json)
+    try storeOrWriteIfMissing(allocator, workspace_dir, "CONFIG.md", configTemplate(), bootstrap_provider);
+
     // IDENTITY.md (identity config — loaded by prompt.zig)
     const identity_tmpl = try identityTemplate(allocator, ctx);
     defer allocator.free(identity_tmpl);
@@ -2556,6 +2560,7 @@ pub fn resetWorkspacePromptFiles(
         .{ .filename = "SOUL.md", .content = soul_tmpl },
         .{ .filename = "AGENTS.md", .content = agentsTemplate() },
         .{ .filename = "TOOLS.md", .content = toolsTemplate() },
+        .{ .filename = "CONFIG.md", .content = configTemplate() },
         .{ .filename = "IDENTITY.md", .content = identity_tmpl },
         .{ .filename = "USER.md", .content = user_tmpl },
         .{ .filename = "HEARTBEAT.md", .content = heartbeatTemplate() },
@@ -2966,6 +2971,10 @@ fn toolsTemplate() []const u8 {
     return WORKSPACE_TOOLS_TEMPLATE;
 }
 
+fn configTemplate() []const u8 {
+    return WORKSPACE_CONFIG_TEMPLATE;
+}
+
 fn identityTemplate(allocator: std.mem.Allocator, ctx: *const ProjectContext) ![]const u8 {
     _ = ctx;
     return allocator.dupe(u8, WORKSPACE_IDENTITY_TEMPLATE);
@@ -3266,7 +3275,7 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     defer std.testing.allocator.free(base);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
-    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
     const agents_content = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
@@ -3310,7 +3319,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
         .clear_memory_markdown = true,
         .dry_run = true,
     }, null);
-    try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
     const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
     memory_file.close();
@@ -3318,7 +3327,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
     }, null);
-    try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
     if (has_distinct_case_memory_file) {
@@ -3336,7 +3345,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     defer std.testing.allocator.free(nested);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{}, null);
-    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
     defer std.testing.allocator.free(agents_path);
@@ -3581,7 +3590,7 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
         .{ .include_bootstrap = true },
         bootstrap_provider,
     );
-    try std.testing.expectEqual(@as(usize, 7), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 8), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
     const disk_agents = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
@@ -4058,6 +4067,13 @@ test "toolsTemplate contains tool docs" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Skills define _how_ tools work") != null);
 }
 
+test "configTemplate contains generated config guide" {
+    const tmpl = configTemplate();
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "CONFIG.md - Generated Config Guide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "`agents.defaults.model.primary`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "`memory.backend`") != null);
+}
+
 test "identityTemplate contains agent name" {
     const tmpl = try identityTemplate(std.testing.allocator, &ProjectContext{ .agent_name = "TestBot" });
     defer std.testing.allocator.free(tmpl);
@@ -4095,9 +4111,9 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
         "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",
-        "USER.md",      "HEARTBEAT.md",
-        "BOOTSTRAP.md",
+        "TOOLS.md",     "CONFIG.md",
+        "IDENTITY.md",  "USER.md",
+        "HEARTBEAT.md", "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {
