@@ -86,6 +86,8 @@ const ChannelSelection = struct {
     enable_channel_email: bool = false,
     enable_channel_lark: bool = false,
     enable_channel_dingtalk: bool = false,
+    enable_channel_wechat: bool = false,
+    enable_channel_wecom: bool = false,
     enable_channel_line: bool = false,
     enable_channel_onebot: bool = false,
     enable_channel_qq: bool = false,
@@ -109,6 +111,8 @@ const ChannelSelection = struct {
         self.enable_channel_email = true;
         self.enable_channel_lark = true;
         self.enable_channel_dingtalk = true;
+        self.enable_channel_wechat = true;
+        self.enable_channel_wecom = true;
         self.enable_channel_line = true;
         self.enable_channel_onebot = true;
         self.enable_channel_qq = true;
@@ -176,6 +180,10 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_lark = true;
         } else if (std.mem.eql(u8, token, "dingtalk")) {
             selection.enable_channel_dingtalk = true;
+        } else if (std.mem.eql(u8, token, "wechat")) {
+            selection.enable_channel_wechat = true;
+        } else if (std.mem.eql(u8, token, "wecom")) {
+            selection.enable_channel_wecom = true;
         } else if (std.mem.eql(u8, token, "line")) {
             selection.enable_channel_line = true;
         } else if (std.mem.eql(u8, token, "onebot")) {
@@ -376,7 +384,7 @@ pub fn build(b: *std.Build) void {
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|wechat|wecom|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -421,6 +429,8 @@ pub fn build(b: *std.Build) void {
     const enable_channel_email = channels.enable_channel_email;
     const enable_channel_lark = channels.enable_channel_lark;
     const enable_channel_dingtalk = channels.enable_channel_dingtalk;
+    const enable_channel_wechat = channels.enable_channel_wechat;
+    const enable_channel_wecom = channels.enable_channel_wecom;
     const enable_channel_line = channels.enable_channel_line;
     const enable_channel_onebot = channels.enable_channel_onebot;
     const enable_channel_qq = channels.enable_channel_qq;
@@ -481,6 +491,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_email", enable_channel_email);
     build_options.addOption(bool, "enable_channel_lark", enable_channel_lark);
     build_options.addOption(bool, "enable_channel_dingtalk", enable_channel_dingtalk);
+    build_options.addOption(bool, "enable_channel_wechat", enable_channel_wechat);
+    build_options.addOption(bool, "enable_channel_wecom", enable_channel_wecom);
     build_options.addOption(bool, "enable_channel_line", enable_channel_line);
     build_options.addOption(bool, "enable_channel_onebot", enable_channel_onebot);
     build_options.addOption(bool, "enable_channel_qq", enable_channel_qq);
