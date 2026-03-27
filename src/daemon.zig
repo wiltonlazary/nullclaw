@@ -14,6 +14,7 @@ const cron = @import("cron.zig");
 const bus_mod = @import("bus.zig");
 const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
+const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
@@ -102,6 +103,13 @@ pub fn stateFilePath(allocator: std.mem.Allocator, config: *const Config) ![]u8 
         return std.fs.path.join(allocator, &.{ dir, "daemon_state.json" });
     }
     return allocator.dupe(u8, "daemon_state.json");
+}
+
+pub fn outboundDeliveryPath(allocator: std.mem.Allocator, config: *const Config) ![]u8 {
+    if (std.fs.path.dirname(config.config_path)) |dir| {
+        return std.fs.path.join(allocator, &.{ dir, "state", "outbound_delivery.json" });
+    }
+    return allocator.dupe(u8, "outbound_delivery.json");
 }
 
 /// Write daemon state to disk as JSON.
@@ -1284,12 +1292,23 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     }
 
     var dispatch_stats = dispatch.DispatchStats{};
+    const delivery_path = try outboundDeliveryPath(allocator, config);
+    defer allocator.free(delivery_path);
+    if (std.fs.path.dirname(delivery_path)) |delivery_dir| {
+        std.fs.makeDirAbsolute(delivery_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    var delivery_outbox = try channel_outbox.DeliveryOutbox.init(allocator, delivery_path);
+    defer delivery_outbox.deinit();
 
     state.addComponent("outbound_dispatcher");
+    state.addComponent("outbound_delivery");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcher, .{
-        allocator, &event_bus, &channel_registry, &dispatch_stats,
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcherWithOutbox, .{
+        allocator, &event_bus, &channel_registry, &dispatch_stats, &delivery_outbox,
     })) |thread| {
         dispatcher_thread = thread;
         state.markRunning("outbound_dispatcher");
@@ -1297,6 +1316,18 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     } else |err| {
         state.markError("outbound_dispatcher", @errorName(err));
         stdout.print("Warning: outbound dispatcher thread failed: {}\n", .{err}) catch {};
+    }
+
+    var delivery_thread: ?std.Thread = null;
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runDurableOutboundWorker, .{
+        allocator, &delivery_outbox, &channel_registry,
+    })) |thread| {
+        delivery_thread = thread;
+        state.markRunning("outbound_delivery");
+        health.markComponentOk("outbound_delivery");
+    } else |err| {
+        state.markError("outbound_delivery", @errorName(err));
+        stdout.print("Warning: outbound delivery thread failed: {}\n", .{err}) catch {};
     }
 
     // Main thread: wait for shutdown signal (poll-based)
@@ -1308,6 +1339,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Close bus to signal dispatcher to exit
     event_bus.close();
+    delivery_outbox.close();
 
     // Write final state
     state.markError("gateway", "shutting down");
@@ -1316,6 +1348,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Wait for threads
     if (inbound_thread) |t| t.join();
     if (dispatcher_thread) |t| t.join();
+    if (delivery_thread) |t| t.join();
     if (chan_thread) |t| t.join();
     if (sched_thread) |t| t.join();
     if (hb_thread) |t| t.join();
