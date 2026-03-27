@@ -34,7 +34,12 @@ pub const CalculatorTool = struct {
             return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "values array must not be empty", .{}) };
         }
 
-        const values = try extractValues(allocator, values_arr);
+        const values = extractValues(allocator, values_arr) catch |err| switch (err) {
+            error.InvalidNumber => {
+                return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) };
+            },
+            else => return err,
+        };
         defer allocator.free(values);
 
         const result = compute(allocator, operation, values, args) catch |err| {
@@ -49,7 +54,6 @@ pub const CalculatorTool = struct {
         errdefer allocator.free(values);
         for (arr, 0..) |item, i| {
             values[i] = jsonToFloat(item) orelse {
-                allocator.free(values);
                 return error.InvalidNumber;
             };
         }
@@ -64,7 +68,7 @@ pub const CalculatorTool = struct {
         };
     }
 
-    fn compute(allocator: std.mem.Allocator, operation: []const u8, values: []const f64, args: JsonObjectMap) ![]const u8 {
+    fn compute(allocator: std.mem.Allocator, operation: []const u8, values: []f64, args: JsonObjectMap) ![]const u8 {
         if (std.mem.eql(u8, operation, "add")) {
             if (values.len < 1) return error.AddRequiresValues;
             var sum: f64 = 0.0;
@@ -173,13 +177,13 @@ pub const CalculatorTool = struct {
         return error.UnknownOperation;
     }
 
-    fn median(values: []const f64) f64 {
-        const sorted = sortCopy(values);
+    fn median(values: []f64) f64 {
+        sortValues(values);
         const n = values.len;
         if (n % 2 == 1) {
-            return sorted[n / 2];
+            return values[n / 2];
         }
-        return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+        return (values[n / 2 - 1] + values[n / 2]) / 2.0;
     }
 
     fn populationStdev(values: []const f64) f64 {
@@ -195,36 +199,37 @@ pub const CalculatorTool = struct {
         return @sqrt(sq_diff_sum / n);
     }
 
-    fn percentile(values: []const f64, rank: f64) f64 {
-        const sorted = sortCopy(values);
+    fn percentile(values: []f64, rank: f64) f64 {
+        sortValues(values);
         const n = values.len;
-        if (n == 1) return sorted[0];
+        if (n == 1) return values[0];
         const idx = (rank / 100.0) * (@as(f64, @floatFromInt(n)) - 1.0);
         const lower: usize = @intFromFloat(@floor(idx));
         const upper: usize = @min(lower + 1, n - 1);
         const frac = idx - @as(f64, @floatFromInt(lower));
-        return sorted[lower] + frac * (sorted[upper] - sorted[lower]);
+        return values[lower] + frac * (values[upper] - values[lower]);
     }
 
-    fn sortCopy(values: []const f64) [MAX_SORT_LEN]f64 {
-        var buf: [MAX_SORT_LEN]f64 = undefined;
-        const len = @min(values.len, MAX_SORT_LEN);
-        @memcpy(buf[0..len], values[0..len]);
-        if (len > 1) {
-            std.mem.sort(f64, buf[0..len], {}, struct {
+    fn sortValues(values: []f64) void {
+        if (values.len > 1) {
+            std.mem.sort(f64, values, {}, struct {
                 fn lessThan(_: void, a: f64, b: f64) bool {
                     return a < b;
                 }
             }.lessThan);
         }
-        return buf;
     }
 
     fn formatResult(allocator: std.mem.Allocator, value: f64) ![]const u8 {
-        var buf: [64]u8 = undefined;
-        const str = std.fmt.bufPrint(&buf, "{d:.6}", .{value}) catch "0";
-        const trimmed = trimFloatStr(str);
-        return allocator.dupe(u8, trimmed);
+        const raw = try std.fmt.allocPrint(allocator, "{d:.6}", .{value});
+        errdefer allocator.free(raw);
+
+        const trimmed = trimFloatStr(raw);
+        if (trimmed.len == raw.len) return raw;
+
+        const result = try allocator.dupe(u8, trimmed);
+        allocator.free(raw);
+        return result;
     }
 
     fn trimFloatStr(s: []const u8) []const u8 {
@@ -234,8 +239,6 @@ pub const CalculatorTool = struct {
         return if (s[end - 1] == '.') s[0 .. end - 1] else s[0..end];
     }
 };
-
-const MAX_SORT_LEN = 1024;
 
 test "calculator tool name and description" {
     var ct = CalculatorTool{};
@@ -619,4 +622,51 @@ test "calculator log zero" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer std.testing.allocator.free(result.output);
     try std.testing.expect(!result.success);
+}
+
+test "calculator invalid values return failed tool result" {
+    // Regression: non-numeric values used to escape as a raw error and double-free the values buffer.
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[1,\"oops\"]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("InvalidNumber", result.output);
+}
+
+test "calculator median handles values beyond 1024 items" {
+    // Regression: median used to sort only the first 1024 values and ignore later entries.
+    const values = try std.testing.allocator.alloc(f64, 1026);
+    defer std.testing.allocator.free(values);
+
+    for (values[0..1024], 0..) |*value, i| {
+        value.* = @floatFromInt(i + 1);
+    }
+    values[1024] = -1001.0;
+    values[1025] = -1000.0;
+
+    try std.testing.expectEqual(@as(f64, 511.5), CalculatorTool.median(values));
+}
+
+test "calculator percentile handles values beyond 1024 items" {
+    // Regression: percentile used to index past the fixed 1024-item scratch buffer.
+    const values = try std.testing.allocator.alloc(f64, 1025);
+    defer std.testing.allocator.free(values);
+
+    for (values, 0..) |*value, i| {
+        value.* = @floatFromInt(i);
+    }
+
+    try std.testing.expectEqual(@as(f64, 1024.0), CalculatorTool.percentile(values, 100.0));
+}
+
+test "calculator formats large finite results without zero fallback" {
+    // Regression: large finite outputs used to overflow a fixed buffer and become the literal string "0".
+    const result = try CalculatorTool.formatResult(std.testing.allocator, std.math.pow(f64, 10.0, 100.0));
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expect(result.len > 64);
+    try std.testing.expect(!std.mem.eql(u8, result, "0"));
 }
