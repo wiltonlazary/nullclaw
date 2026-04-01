@@ -3,6 +3,8 @@ const observability = @import("observability.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
+const log = std.log.scoped(.heartbeat);
+
 const MAX_HEARTBEAT_FILE_BYTES: usize = 64 * 1024;
 
 pub const TickOutcome = enum {
@@ -27,7 +29,7 @@ pub const HeartbeatEngine = struct {
     pub fn init(enabled: bool, interval_minutes: u32, workspace_dir: []const u8, observer: ?observability.Observer) HeartbeatEngine {
         return .{
             .enabled = enabled,
-            .interval_minutes = if (interval_minutes < 5) 5 else interval_minutes,
+            .interval_minutes = interval_minutes,
             .workspace_dir = workspace_dir,
             .observer = observer,
         };
@@ -59,12 +61,25 @@ pub const HeartbeatEngine = struct {
     pub fn collectTasks(self: *const HeartbeatEngine, allocator: std.mem.Allocator) ![][]const u8 {
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
-            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
+            log.info("reading HEARTBEAT.md via bootstrap provider", .{});
+            const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch |err| {
+                log.warn("bootstrap provider failed to load HEARTBEAT.md: {s}", .{@errorName(err)});
+                return &.{};
+            };
             if (bp_content) |content| {
                 defer allocator.free(content);
-                if (isContentEffectivelyEmpty(content)) return &.{};
-                return parseTasks(allocator, content);
+                if (isContentEffectivelyEmpty(content)) {
+                    log.info("HEARTBEAT.md is empty or has no actionable content", .{});
+                    return &.{};
+                }
+                const tasks = try parseTasks(allocator, content);
+                log.info("collected {d} task(s) from HEARTBEAT.md", .{tasks.len});
+                for (tasks, 0..) |task, i| {
+                    log.info("  task[{d}]: {s}", .{ i, task });
+                }
+                return tasks;
             }
+            log.info("HEARTBEAT.md not found via bootstrap provider", .{});
             return &.{};
         }
 
@@ -72,8 +87,12 @@ pub const HeartbeatEngine = struct {
         const heartbeat_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(heartbeat_path);
 
+        log.info("reading HEARTBEAT.md from {s}", .{heartbeat_path});
         const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
+            error.FileNotFound => {
+                log.info("HEARTBEAT.md not found at {s}", .{heartbeat_path});
+                return &.{};
+            },
             else => return err,
         };
         defer file.close();
@@ -81,8 +100,16 @@ pub const HeartbeatEngine = struct {
         const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
 
-        if (isContentEffectivelyEmpty(content)) return &.{};
-        return parseTasks(allocator, content);
+        if (isContentEffectivelyEmpty(content)) {
+            log.info("HEARTBEAT.md is empty or has no actionable content", .{});
+            return &.{};
+        }
+        const tasks = try parseTasks(allocator, content);
+        log.info("collected {d} task(s) from HEARTBEAT.md", .{tasks.len});
+        for (tasks, 0..) |task, i| {
+            log.info("  task[{d}]: {s}", .{ i, task });
+        }
+        return tasks;
     }
 
     pub fn freeTasks(allocator: std.mem.Allocator, tasks: []const []const u8) void {
@@ -105,18 +132,23 @@ pub const HeartbeatEngine = struct {
 
     /// Perform a single heartbeat tick.
     pub fn tick(self: *const HeartbeatEngine, allocator: std.mem.Allocator) !TickResult {
+        log.info("heartbeat tick starting (interval={d}m)", .{self.interval_minutes});
+
         // Try bootstrap provider first when available.
         if (self.bootstrap_provider) |bp| {
             const bp_content = bp.load_excerpt(allocator, "HEARTBEAT.md", MAX_HEARTBEAT_FILE_BYTES) catch null;
             if (bp_content) |content| {
                 defer allocator.free(content);
                 if (isContentEffectivelyEmpty(content)) {
+                    log.info("heartbeat tick skipped: file empty", .{});
                     return .{ .outcome = .skipped_empty_file, .task_count = 0 };
                 }
                 const tasks = try self.collectTasks(allocator);
                 defer freeTasks(allocator, tasks);
+                log.info("heartbeat tick processed: {d} task(s) dispatched", .{tasks.len});
                 return .{ .outcome = .processed, .task_count = tasks.len };
             }
+            log.info("heartbeat tick skipped: file missing", .{});
             return .{ .outcome = .skipped_missing_file, .task_count = 0 };
         }
 
@@ -125,7 +157,10 @@ pub const HeartbeatEngine = struct {
         defer allocator.free(heartbeat_path);
 
         const file = std.fs.openFileAbsolute(heartbeat_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return .{ .outcome = .skipped_missing_file, .task_count = 0 },
+            error.FileNotFound => {
+                log.info("heartbeat tick skipped: file missing", .{});
+                return .{ .outcome = .skipped_missing_file, .task_count = 0 };
+            },
             else => return err,
         };
         defer file.close();
@@ -133,12 +168,14 @@ pub const HeartbeatEngine = struct {
         const content = try file.readToEndAlloc(allocator, MAX_HEARTBEAT_FILE_BYTES);
         defer allocator.free(content);
         if (isContentEffectivelyEmpty(content)) {
+            log.info("heartbeat tick skipped: file empty", .{});
             return .{ .outcome = .skipped_empty_file, .task_count = 0 };
         }
 
         const tasks = try self.collectTasks(allocator);
         defer freeTasks(allocator, tasks);
 
+        log.info("heartbeat tick processed: {d} task(s) dispatched", .{tasks.len});
         return .{ .outcome = .processed, .task_count = tasks.len };
     }
 
@@ -284,9 +321,9 @@ test "parseTasks mixed markdown" {
     try std.testing.expectEqualStrings("Task B", tasks[1]);
 }
 
-test "HeartbeatEngine init clamps interval" {
-    const engine = HeartbeatEngine.init(true, 2, "/tmp", null);
-    try std.testing.expectEqual(@as(u32, 5), engine.interval_minutes);
+test "HeartbeatEngine init preserves low interval" {
+    const engine = HeartbeatEngine.init(true, 1, "/tmp", null);
+    try std.testing.expectEqual(@as(u32, 1), engine.interval_minutes);
 }
 
 test "HeartbeatEngine init preserves valid interval" {
