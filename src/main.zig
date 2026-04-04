@@ -1057,15 +1057,8 @@ const VisibleSkills = struct {
 };
 
 fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !VisibleSkills {
-    const home = yc.platform.getHomeDir(allocator) catch null;
-    defer if (home) |path| allocator.free(path);
-
-    var community_base: ?[]u8 = null;
+    var community_base: ?[]u8 = yc.config_paths.defaultConfigDir(allocator) catch null;
     errdefer if (community_base) |path| allocator.free(path);
-
-    if (home) |path| {
-        community_base = std.fs.path.join(allocator, &.{ path, ".nullclaw" }) catch null;
-    }
 
     if (community_base) |base| {
         if (yc.skills.listSkillsMerged(allocator, base, workspace_dir)) |skills| {
@@ -3004,7 +2997,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
             std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
             std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
-            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in auth.json in your nullclaw config directory.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -3229,7 +3222,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -3283,7 +3276,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {
