@@ -578,7 +578,7 @@ fn codexStreamRequest(
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeCodexStreamResult(allocator, accumulated.items);
             }
-            return mapCodexCurlExitCodeToError(code);
+            return http_util.mapCurlExitCodeToError(code);
         },
         else => {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
@@ -603,16 +603,6 @@ fn finalizeCodexStreamResult(allocator: std.mem.Allocator, accumulated: []const 
         .content = content,
         .usage = .{ .completion_tokens = @intCast((accumulated.len + 3) / 4) },
         .model = "",
-    };
-}
-
-fn mapCodexCurlExitCodeToError(code: u8) anyerror {
-    return switch (code) {
-        6 => error.CurlDnsError,
-        7 => error.CurlConnectError,
-        28 => error.CurlTimeout,
-        35, 51, 58, 60 => error.CurlTlsError,
-        else => error.CurlFailed,
     };
 }
 
@@ -1347,14 +1337,6 @@ test "parseCodexSseEvent response.failed event" {
     const line = "data: {\"type\":\"response.failed\"}";
     const result = try parseCodexSseEvent(std.testing.allocator, line);
     try std.testing.expect(result == .error_msg);
-}
-
-test "mapCodexCurlExitCodeToError classifies timeout" {
-    try std.testing.expect(mapCodexCurlExitCodeToError(28) == error.CurlTimeout);
-}
-
-test "mapCodexCurlExitCodeToError classifies tls failures" {
-    try std.testing.expect(mapCodexCurlExitCodeToError(35) == error.CurlTlsError);
 }
 
 test "effectiveCodexStallTimeoutSecs caps long request timeout" {

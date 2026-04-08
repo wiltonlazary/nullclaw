@@ -722,6 +722,21 @@ fn sendTelegramStartGreeting(
     };
 }
 
+fn telegramConversationContext(
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+) ?ConversationContext {
+    return buildConversationContext(.{
+        .channel = "telegram",
+        .account_id = account_id,
+        .delivery_chat_id = sender,
+        .peer_id = sender,
+        .is_group = is_group,
+        .group_id = if (is_group) sender else null,
+    });
+}
+
 fn handleTelegramInteractiveCallback(
     allocator: std.mem.Allocator,
     runtime: *ChannelRuntime,
@@ -733,13 +748,7 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
-    const conversation_context = buildConversationContext(.{
-        .channel = "telegram",
-        .account_id = tg_ptr.account_id,
-        .peer_id = sender,
-        .is_group = is_group,
-        .group_id = if (is_group) sender else null,
-    });
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var response_owned = false;
     const response = blk: {
@@ -958,14 +967,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = buildConversationContext(.{
-        .channel = "telegram",
-        .account_id = tg_ptr.account_id,
-        .delivery_chat_id = sender,
-        .peer_id = sender,
-        .is_group = is_group,
-        .group_id = if (is_group) sender else null,
-    });
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -2610,6 +2612,19 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
+}
+
+test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
+    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+
+    // Regression: Telegram button callbacks must keep the outbound delivery target,
+    // or scheduled/tool-driven follow-ups can route to the session peer only.
+    try std.testing.expectEqualStrings("telegram", context.channel.?);
+    try std.testing.expectEqualStrings("main", context.account_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
 }
 
 test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {

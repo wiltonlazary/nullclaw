@@ -22,7 +22,7 @@ fn classifyCurlExitCode(code: u8) []const u8 {
     };
 }
 
-fn mapCurlExitCodeToError(code: u8) anyerror {
+pub fn mapCurlExitCodeToError(code: u8) anyerror {
     return switch (code) {
         6 => error.CurlDnsError,
         7 => error.CurlConnectError,
