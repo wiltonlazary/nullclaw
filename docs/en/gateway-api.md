@@ -38,6 +38,7 @@ Default gateway endpoint: `http://127.0.0.1:3000`
 | `/whatsapp` | GET | Query params | Meta webhook verification |
 | `/whatsapp` | POST | Meta signature | WhatsApp inbound webhook |
 | `/max` | POST | `X-Max-Bot-Api-Secret` when configured | Max inbound webhook delivery |
+| `/api/messages` | POST | `Authorization: Bearer <Bot Framework JWT>` and optional `X-Webhook-Secret` | Teams Bot Framework inbound webhook |
 | `/.well-known/agent-card.json` | GET | None | A2A Agent Card discovery (public) |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 endpoint |
 
@@ -116,6 +117,13 @@ Max webhook notes:
 - `nullclaw` routes `/max` to the configured Max account by `account_id` query first, then by `X-Max-Bot-Api-Secret`.
 - If `channels.max[].webhook_secret` is configured, the header is required and must match exactly.
 - Use HTTPS in the configured Max-side webhook URL.
+
+Teams webhook notes:
+
+- `nullclaw` validates the Bot Framework bearer token against Microsoft's OpenID metadata and signing keys before accepting the activity.
+- The token issuer must be `https://api.botframework.com`, the audience must match the configured Teams `client_id`, and the token `serviceUrl` must match the activity body.
+- Teams `channelId` endorsements are enforced from the published Bot Framework key metadata.
+- If `channels.teams[].webhook_secret` is configured, `X-Webhook-Secret` must also match exactly.
 
 ## A2A (Agent-to-Agent Protocol)
 

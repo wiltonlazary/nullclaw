@@ -91,6 +91,7 @@ The example below is enough to run local CLI mode (replace API key):
 - Controls runtime diagnostics and observability output.
 - For OpenTelemetry, use the nested `diagnostics.otel` object.
 - OTEL spans are flushed at natural runtime boundaries such as turn completion and agent shutdown, with batch flushing still used as a fallback for longer-running flows.
+- `diagnostics.otel.endpoint` must be `https://...` for remote collectors. Plain `http://...` is accepted only for localhost/private collectors such as `http://127.0.0.1:4318`.
 
 Example:
 
@@ -103,7 +104,7 @@ Example:
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "http://otel:4318",
+      "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -681,6 +682,7 @@ Rules:
 
 - Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
+- Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams[].webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
 

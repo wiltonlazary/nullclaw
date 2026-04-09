@@ -76,6 +76,7 @@ nullclaw onboard --interactive
 - 用于控制运行时诊断与可观测性输出。
 - 配置 OpenTelemetry 时，请使用嵌套的 `diagnostics.otel` 对象。
 - OTEL spans 会在回合完成、agent 结束等自然运行边界触发 flush；更长运行流程仍保留批量 flush 作为兜底。
+- `diagnostics.otel.endpoint` 连接远程 collector 时必须使用 `https://...`；`http://...` 仅允许用于 `http://127.0.0.1:4318` 这类 localhost/私有地址。
 
 示例：
 
@@ -88,7 +89,7 @@ nullclaw onboard --interactive
     "log_message_payloads": true,
     "log_llm_io": true,
     "otel": {
-      "endpoint": "http://otel:4318",
+      "endpoint": "https://otel.example.com:4318",
       "service_name": "nullclaw",
       "headers": {
         "Authorization": "Bearer example-token"
@@ -444,6 +445,7 @@ WeChat 说明：
 
 - 空 `allow_from` 的行为因渠道而异。有些渠道（例如 WeChat 和 Discord）会把省略或留空视为“关闭过滤”，而不是“拒绝所有”；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
+- Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams[].webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：
 

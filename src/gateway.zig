@@ -10,6 +10,7 @@
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
+const builtin = @import("builtin");
 const std = @import("std");
 const build_options = @import("build_options");
 const daemon = @import("daemon.zig");
@@ -27,6 +28,7 @@ const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
+const botframework_auth = @import("security/botframework_auth.zig");
 const tencent_crypto = @import("security/tencent_crypto.zig");
 const root_mod = @import("root.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
@@ -498,6 +500,7 @@ pub const GatewayState = struct {
     wecom_encoding_aes_key: []const u8 = "",
     wecom_corp_id: []const u8 = "",
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
+    teams_auth_cache: botframework_auth.KeyCache = .{},
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
 
@@ -525,6 +528,7 @@ pub const GatewayState = struct {
         self.qq_channels.deinit(self.allocator);
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
+        self.teams_auth_cache.deinit(self.allocator);
         if (self.pairing_guard) |*guard| {
             guard.deinit();
         }
@@ -719,6 +723,11 @@ fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (al != bl) return false;
     }
     return true;
+}
+
+fn asciiEndsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (suffix.len > haystack.len) return false;
+    return asciiEqlIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
 }
 
 // ── WhatsApp HMAC-SHA256 Signature Verification ─────────────────
@@ -4676,6 +4685,11 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"error\":\"missing serviceUrl\"}";
         return;
     };
+    const channel_id = jsonStringField(body, "channelId") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing channelId\"}";
+        return;
+    };
     if (!isValidBotFrameworkServiceUrl(service_url)) {
         std.log.scoped(.teams).warn("Teams webhook rejected untrusted serviceUrl: {s}", .{service_url});
         ctx.response_status = "400 Bad Request";
@@ -4701,10 +4715,26 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         };
     };
 
-    // Verify webhook secret if configured.
-    // TODO: For production, validate the Bot Framework JWT bearer token from the
-    // Authorization header against Microsoft's OpenID metadata instead of using
-    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+    const auth_header = extractHeader(ctx.raw_request, "Authorization");
+    const bearer = if (auth_header) |header| extractBearerToken(header) else null;
+    const bearer_token = bearer orelse {
+        ctx.response_status = "403 Forbidden";
+        ctx.response_body = "{\"error\":\"forbidden\"}";
+        return;
+    };
+    ctx.state.teams_auth_cache.verifyConnectorToken(
+        ctx.state.allocator,
+        bearer_token,
+        teams_cfg.client_id,
+        service_url,
+        channel_id,
+    ) catch |err| {
+        std.log.scoped(.teams).warn("Teams webhook JWT validation failed: {}", .{err});
+        ctx.response_status = "403 Forbidden";
+        ctx.response_body = "{\"error\":\"forbidden\"}";
+        return;
+    };
+
     if (teams_cfg.webhook_secret) |secret| {
         const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
         if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {
@@ -4712,11 +4742,6 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"error\":\"unauthorized\"}";
             return;
         }
-    } else {
-        // No webhook_secret configured — webhook is open to anyone who knows the URL.
-        // This is acceptable for development but should use webhook_secret or JWT
-        // validation in production deployments.
-        std.log.scoped(.teams).warn("Teams webhook: no webhook_secret configured — request accepted without auth", .{});
     }
 
     // For nested fields, use manual parsing since jsonStringField doesn't handle nesting
@@ -4870,15 +4895,23 @@ fn isValidBotFrameworkServiceUrl(url: []const u8) bool {
     const host = rest[0..host_end];
     if (host.len == 0) return false;
 
-    // Allow known Bot Framework service domains
+    const allowed_exact_hosts = [_][]const u8{
+        "smba.trafficmanager.net",
+    };
+    for (allowed_exact_hosts) |exact_host| {
+        if (asciiEqlIgnoreCase(host, exact_host)) return true;
+    }
+
+    // Allow known Bot Framework service domains, including national cloud variants.
     const allowed_suffixes = [_][]const u8{
         ".botframework.com",
+        ".botframework.azure.us",
         ".teams.microsoft.com",
+        ".teams.microsoft.us",
         ".skype.com",
-        ".microsoft.com",
     };
     for (allowed_suffixes) |suffix| {
-        if (std.mem.endsWith(u8, host, suffix)) return true;
+        if (asciiEndsWithIgnoreCase(host, suffix)) return true;
     }
     return false;
 }
@@ -5339,32 +5372,32 @@ pub fn run(
                 response_body = cron_ctx.response_body;
             }
         } else if (findWebhookRouteDescriptor(base_path)) |desc| {
-                var webhook_ctx = WebhookHandlerContext{
-                    .root_allocator = allocator,
-                    .req_allocator = req_allocator,
-                    .raw_request = raw,
-                    .method = method_str,
-                    .target = target,
-                    .client_identifier = client_identifier,
-                    .config_opt = config_opt,
-                    .state = &state,
-                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+            var webhook_ctx = WebhookHandlerContext{
+                .root_allocator = allocator,
+                .req_allocator = req_allocator,
+                .raw_request = raw,
+                .method = method_str,
+                .target = target,
+                .client_identifier = client_identifier,
+                .config_opt = config_opt,
+                .state = &state,
+                .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
             };
             desc.handler(&webhook_ctx);
             response_status = webhook_ctx.response_status;
             response_content_type = webhook_ctx.response_content_type;
             response_body = webhook_ctx.response_body;
         } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
-                var webhook_ctx = WebhookHandlerContext{
-                    .root_allocator = allocator,
-                    .req_allocator = req_allocator,
-                    .raw_request = raw,
-                    .method = method_str,
-                    .target = target,
-                    .client_identifier = client_identifier,
-                    .config_opt = config_opt,
-                    .state = &state,
-                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+            var webhook_ctx = WebhookHandlerContext{
+                .root_allocator = allocator,
+                .req_allocator = req_allocator,
+                .raw_request = raw,
+                .method = method_str,
+                .target = target,
+                .client_identifier = client_identifier,
+                .config_opt = config_opt,
+                .state = &state,
+                .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
             };
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
@@ -7816,6 +7849,182 @@ test "teamsSessionKeyRouted uses conversation id for channel chats" {
     ;
     const key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-chan", "user-42");
     try std.testing.expectEqualStrings("agent:teams-channel-agent:teams:channel:conv-chan", key);
+}
+
+fn buildTeamsWebhookRequest(
+    allocator: std.mem.Allocator,
+    bearer_token: ?[]const u8,
+    webhook_secret: ?[]const u8,
+    body: []const u8,
+) ![]u8 {
+    const auth_header = if (bearer_token) |token|
+        try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}\r\n", .{token})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(auth_header);
+
+    const secret_header = if (webhook_secret) |secret|
+        try std.fmt.allocPrint(allocator, "X-Webhook-Secret: {s}\r\n", .{secret})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(secret_header);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "POST /api/messages HTTP/1.1\r\nHost: localhost\r\n{s}{s}Content-Type: application/json\r\n\r\n{s}",
+        .{ auth_header, secret_header, body },
+    );
+}
+
+test "handleTeamsWebhookRoute rejects missing bearer token" {
+    if (!build_options.enable_channel_teams) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "test-app-id",
+            .client_secret = "teams-secret",
+            .tenant_id = "tenant-1",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+
+    const body =
+        \\{"type":"message","text":"hi","serviceUrl":"https://smba.trafficmanager.net/amer/","channelId":"msteams","conversation":{"id":"conv-1","conversationType":"personal"},"from":{"id":"user-42","name":"Alice"},"channelData":{"tenant":{"id":"tenant-1"}}}
+    ;
+    const raw_request = try buildTeamsWebhookRequest(allocator, null, null, body);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("403 Forbidden", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", ctx.response_body);
+}
+
+test "handleTeamsWebhookRoute accepts valid connector JWT" {
+    if (!build_options.enable_channel_teams) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "test-app-id",
+            .client_secret = "teams-secret",
+            .tenant_id = "tenant-1",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+
+    const body =
+        \\{"type":"message","text":"hi","serviceUrl":"https://smba.trafficmanager.net/amer/","channelId":"msteams","conversation":{"id":"conv-1","conversationType":"personal"},"from":{"id":"user-42","name":"Alice"},"channelData":{"tenant":{"id":"tenant-1"}}}
+    ;
+    const raw_request = try buildTeamsWebhookRequest(allocator, botframework_auth.fixtureTokenForTest(), null, body);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.teams_auth_cache.seedFixtureForTest(std.testing.allocator);
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("202 Accepted", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"status\":\"accepted\"}", ctx.response_body);
+}
+
+test "handleTeamsWebhookRoute requires configured webhook secret after JWT validation" {
+    if (!build_options.enable_channel_teams) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const teams_accounts = [_]config_types.TeamsConfig{
+        .{
+            .account_id = "default",
+            .client_id = "test-app-id",
+            .client_secret = "teams-secret",
+            .tenant_id = "tenant-1",
+            .webhook_secret = "teams-webhook-secret-012345",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .teams = &teams_accounts },
+    };
+
+    const body =
+        \\{"type":"message","text":"hi","serviceUrl":"https://smba.trafficmanager.net/amer/","channelId":"msteams","conversation":{"id":"conv-1","conversationType":"personal"},"from":{"id":"user-42","name":"Alice"},"channelData":{"tenant":{"id":"tenant-1"}}}
+    ;
+    const raw_request = try buildTeamsWebhookRequest(allocator, botframework_auth.fixtureTokenForTest(), null, body);
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.teams_auth_cache.seedFixtureForTest(std.testing.allocator);
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/api/messages",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleTeamsWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("401 Unauthorized", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"unauthorized\"}", ctx.response_body);
+}
+
+test "isValidBotFrameworkServiceUrl accepts documented Teams traffic manager host" {
+    try std.testing.expect(isValidBotFrameworkServiceUrl("https://smba.trafficmanager.net/amer/"));
+    try std.testing.expect(isValidBotFrameworkServiceUrl("https://SMBA.TRAFFICMANAGER.NET/teams/"));
+}
+
+test "isValidBotFrameworkServiceUrl rejects unrelated microsoft domains" {
+    try std.testing.expect(!isValidBotFrameworkServiceUrl("https://graph.microsoft.com/v1.0"));
+    try std.testing.expect(!isValidBotFrameworkServiceUrl("https://contoso.microsoft.com/"));
 }
 
 test "webhookRouting uses route engine when standardized peer metadata is present" {

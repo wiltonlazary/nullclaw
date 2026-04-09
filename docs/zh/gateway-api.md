@@ -24,6 +24,7 @@
 | `/whatsapp` | GET | Query 参数 | Meta Webhook 验证 |
 | `/whatsapp` | POST | Meta 签名 | WhatsApp 入站消息 |
 | `/max` | POST | `X-Max-Bot-Api-Secret`（配置后必填） | Max 入站 webhook |
+| `/api/messages` | POST | `Authorization: Bearer <Bot Framework JWT>`，以及可选的 `X-Webhook-Secret` | Teams Bot Framework 入站 webhook |
 | `/.well-known/agent-card.json` | GET | 无 | A2A Agent Card 发现（公开） |
 | `/a2a` | POST | `Authorization: Bearer <token>` | A2A JSON-RPC 2.0 端点 |
 
@@ -102,6 +103,13 @@ Max webhook 说明：
 - `nullclaw` 对 `/max` 路由优先按 `account_id` query 参数匹配，其次按 `X-Max-Bot-Api-Secret` 匹配。
 - 如果 `channels.max[].webhook_secret` 已配置，header 必须存在且完全匹配。
 - Max 侧配置的 webhook URL 必须使用 HTTPS。
+
+Teams webhook 说明：
+
+- `nullclaw` 会先用 Microsoft 发布的 OpenID metadata 和 signing keys 验证 Bot Framework bearer token，再接受该 activity。
+- token 的 issuer 必须是 `https://api.botframework.com`，audience 必须匹配配置中的 Teams `client_id`，并且 token 中的 `serviceUrl` 必须与 activity body 一致。
+- 会按 Bot Framework key metadata 中公布的 endorsement 校验 Teams `channelId`。
+- 如果配置了 `channels.teams[].webhook_secret`，还会额外要求 `X-Webhook-Secret` 精确匹配。
 
 ## A2A（Agent-to-Agent 协议）
 
