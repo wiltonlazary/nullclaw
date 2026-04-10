@@ -101,21 +101,24 @@ fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     return null;
 }
 
+fn lookupErrorMessageField(obj: std.json.ObjectMap) ?[]const u8 {
+    if (obj.get("message")) |message| {
+        if (message == .string) return message.string;
+    }
+    if (obj.get("msg")) |message| {
+        if (message == .string) return message.string;
+    }
+    return null;
+}
+
 fn lookupFallbackMessage(root_obj: std.json.ObjectMap) ?[]const u8 {
     if (root_obj.get("error")) |err_value| {
         if (err_value == .object) {
-            const err_obj = err_value.object;
-            if (err_obj.get("message")) |message| {
-                if (message == .string) return message.string;
-            }
+            if (lookupErrorMessageField(err_value.object)) |message| return message;
         }
     }
 
-    if (root_obj.get("message")) |message| {
-        if (message == .string) return message.string;
-    }
-
-    return null;
+    return lookupErrorMessageField(root_obj);
 }
 
 fn isResponsesFallbackMessage(message: []const u8) bool {
@@ -1116,6 +1119,11 @@ pub const OpenAiCompatibleProvider = struct {
                             reasoning_content = try allocator.dupe(u8, rc.string);
                     }
                 }
+                if (reasoning_content == null) {
+                    if (msg_obj.get("reasoning_details")) |details| {
+                        reasoning_content = try root.extractReasoningTextFromDetails(allocator, details);
+                    }
+                }
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
                 errdefer {
@@ -1278,16 +1286,8 @@ pub const OpenAiCompatibleProvider = struct {
                 "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
                 .{ self.name, request_text_bytes, self.max_streaming_prompt_bytes.? },
             );
-            const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-            if (fallback.content) |text| {
-                callback(callback_ctx, root.StreamChunk.textDelta(text));
-            }
-            callback(callback_ctx, root.StreamChunk.finalChunk());
-            return .{
-                .content = fallback.content,
-                .usage = fallback.usage,
-                .model = fallback.model,
-            };
+            var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+            return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
         }
 
         const url = try self.chatCompletionsUrl(allocator);
@@ -1918,6 +1918,26 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
 }
 
+test "parseNativeResponse reads reasoning_details field" {
+    const body =
+        \\{"choices":[{"message":{"content":"Visible answer","reasoning_details":[{"type":"reasoning.summary","summary":"plan"},{"type":"reasoning.text","text":"step by step"}]}}],"model":"openrouter/auto"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expectEqualStrings("Visible answer", result.content.?);
+    try std.testing.expectEqualStrings("plan\nstep by step", result.reasoning_content.?);
+}
+
 test "parseNativeResponse supports content array text parts" {
     const body =
         \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
@@ -2394,6 +2414,12 @@ test "shouldFallbackToResponses only for explicit 404 payloads" {
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
+}
+
+test "shouldFallbackToResponses accepts msg fallback fields" {
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"Not found\",\"code\":404}}"));
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"msg\":\"unknown endpoint\"}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"No endpoints found that support image input\",\"code\":404}}"));
 }
 
 test "returnLoggedCompatibleApiError preserves fallback error" {

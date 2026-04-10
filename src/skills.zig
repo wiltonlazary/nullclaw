@@ -1,8 +1,11 @@
 const std = @import("std");
 const zig_builtin = @import("builtin");
 const fs_compat = @import("fs_compat.zig");
+const http_util = @import("http_util.zig");
+const net_security = @import("net_security.zig");
 const platform = @import("platform.zig");
 const json_miniparse = @import("json_miniparse.zig");
+const observability = @import("observability.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -524,7 +527,8 @@ fn parseFrontmatterSkill(
 /// Reads SKILL.toml (preferred), then skill.json (legacy), then SKILL.md fallback.
 /// If both manifests are missing but SKILL.md exists, loads a markdown-only skill using
 /// the directory name as skill name (zeroclaw-compatible behavior).
-pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skill {
+pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8, observer: ?observability.Observer) !Skill {
+    var timer = std.time.Timer.start() catch null;
     const toml_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.toml", .{skill_dir_path});
     defer allocator.free(toml_path);
     const manifest_path = try std.fmt.allocPrint(allocator, "{s}/skill.json", .{skill_dir_path});
@@ -538,79 +542,93 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
     };
     defer if (toml_bytes) |bytes| allocator.free(bytes);
 
-    if (toml_bytes) |toml| {
-        const toml_name = parseTomlSkillField(toml, "name") orelse return error.InvalidManifest;
-        const toml_version = parseTomlSkillField(toml, "version") orelse "0.1.0";
-        const toml_description = parseTomlSkillField(toml, "description") orelse "";
-        const toml_author = parseTomlSkillField(toml, "author") orelse "";
+    const skill = blk: {
+        if (toml_bytes) |toml| {
+            const toml_name = parseTomlSkillField(toml, "name") orelse return error.InvalidManifest;
+            const toml_version = parseTomlSkillField(toml, "version") orelse "0.1.0";
+            const toml_description = parseTomlSkillField(toml, "description") orelse "";
+            const toml_author = parseTomlSkillField(toml, "author") orelse "";
 
-        const name = try allocator.dupe(u8, toml_name);
-        errdefer allocator.free(name);
-        const version = try allocator.dupe(u8, toml_version);
-        errdefer allocator.free(version);
-        const description = try allocator.dupe(u8, toml_description);
-        errdefer allocator.free(description);
-        const author = try allocator.dupe(u8, toml_author);
-        errdefer allocator.free(author);
-        const path = try allocator.dupe(u8, skill_dir_path);
-        errdefer allocator.free(path);
-        const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
-            try allocator.dupe(u8, "");
+            const name = try allocator.dupe(u8, toml_name);
+            errdefer allocator.free(name);
+            const version = try allocator.dupe(u8, toml_version);
+            errdefer allocator.free(version);
+            const description = try allocator.dupe(u8, toml_description);
+            errdefer allocator.free(description);
+            const author = try allocator.dupe(u8, toml_author);
+            errdefer allocator.free(author);
+            const path = try allocator.dupe(u8, skill_dir_path);
+            errdefer allocator.free(path);
+            const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
+                try allocator.dupe(u8, "");
 
-        return Skill{
-            .name = name,
-            .version = version,
-            .description = description,
-            .author = author,
-            .instructions = instructions,
-            .enabled = true,
-            .always = false,
-            .requires_bins = &.{},
-            .requires_env = &.{},
-            .path = path,
+            break :blk Skill{
+                .name = name,
+                .version = version,
+                .description = description,
+                .author = author,
+                .instructions = instructions,
+                .enabled = true,
+                .always = false,
+                .requires_bins = &.{},
+                .requires_env = &.{},
+                .path = path,
+            };
+        }
+
+        const manifest_bytes = fs_compat.readFileAlloc(std.fs.cwd(), allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return error.ManifestNotFound,
         };
-    }
+        defer if (manifest_bytes) |bytes| allocator.free(bytes);
 
-    const manifest_bytes = fs_compat.readFileAlloc(std.fs.cwd(), allocator, manifest_path, 64 * 1024) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return error.ManifestNotFound,
+        if (manifest_bytes) |manifest_bytes_nonnull| {
+            const manifest = parseManifestAlloc(allocator, manifest_bytes_nonnull) catch
+                (parseManifest(manifest_bytes_nonnull) catch return error.InvalidManifest);
+
+            // Dupe all strings so they outlive the manifest_bytes buffer
+            const name = try allocator.dupe(u8, manifest.name);
+            errdefer allocator.free(name);
+            const version = try allocator.dupe(u8, manifest.version);
+            errdefer allocator.free(version);
+            const description = try allocator.dupe(u8, manifest.description);
+            errdefer allocator.free(description);
+            const author = try allocator.dupe(u8, manifest.author);
+            errdefer allocator.free(author);
+            const path = try allocator.dupe(u8, skill_dir_path);
+            errdefer allocator.free(path);
+
+            const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
+                try allocator.dupe(u8, "");
+
+            break :blk Skill{
+                .name = name,
+                .version = version,
+                .description = description,
+                .author = author,
+                .instructions = instructions,
+                .enabled = true,
+                .always = manifest.always,
+                .requires_bins = manifest.requires_bins,
+                .requires_env = manifest.requires_env,
+                .path = path,
+            };
+        }
+
+        break :blk try parseFrontmatterSkill(allocator, skill_dir_path);
     };
-    defer if (manifest_bytes) |bytes| allocator.free(bytes);
 
-    if (manifest_bytes) |manifest_bytes_nonnull| {
-        const manifest = parseManifestAlloc(allocator, manifest_bytes_nonnull) catch
-            (parseManifest(manifest_bytes_nonnull) catch return error.InvalidManifest);
-
-        // Dupe all strings so they outlive the manifest_bytes buffer
-        const name = try allocator.dupe(u8, manifest.name);
-        errdefer allocator.free(name);
-        const version = try allocator.dupe(u8, manifest.version);
-        errdefer allocator.free(version);
-        const description = try allocator.dupe(u8, manifest.description);
-        errdefer allocator.free(description);
-        const author = try allocator.dupe(u8, manifest.author);
-        errdefer allocator.free(author);
-        const path = try allocator.dupe(u8, skill_dir_path);
-        errdefer allocator.free(path);
-
-        const instructions = fs_compat.readFileAlloc(std.fs.cwd(), allocator, instructions_path, 256 * 1024) catch
-            try allocator.dupe(u8, "");
-
-        return Skill{
-            .name = name,
-            .version = version,
-            .description = description,
-            .author = author,
-            .instructions = instructions,
-            .enabled = true,
-            .always = manifest.always,
-            .requires_bins = manifest.requires_bins,
-            .requires_env = manifest.requires_env,
-            .path = path,
-        };
+    if (observer) |obs| {
+        if (timer) |*t| {
+            const event = observability.ObserverEvent{ .skill_load = .{
+                .name = skill.name,
+                .duration_ms = t.read() / std.time.ns_per_ms,
+            } };
+            obs.recordEvent(&event);
+        }
     }
 
-    return try parseFrontmatterSkill(allocator, skill_dir_path);
+    return skill;
 }
 
 /// Free all heap-allocated fields of a Skill.
@@ -692,7 +710,7 @@ fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
 
 /// Scan workspace_dir/skills/ for subdirectories, loading each as a Skill.
 /// Returns owned slice; caller must free with freeSkills().
-pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]Skill {
+pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     const skills_dir_path = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
     defer allocator.free(skills_dir_path);
 
@@ -717,7 +735,7 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]Sk
         const sub_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ skills_dir_path, entry.name });
         defer allocator.free(sub_path);
 
-        if (loadSkill(allocator, sub_path)) |skill| {
+        if (loadSkill(allocator, sub_path, observer)) |skill| {
             try skills_list.append(allocator, skill);
         } else |_| {
             // Skip directories without valid skill.json
@@ -731,12 +749,12 @@ pub fn listSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]Sk
 /// Load skills from two sources: built-in and workspace.
 /// Workspace skills with the same name override built-in skills.
 /// Also runs checkRequirements() on each loaded skill.
-pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, workspace_dir: []const u8) ![]Skill {
+pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, workspace_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     // Load built-in skills first
-    const builtin = listSkills(allocator, builtin_dir) catch try allocator.alloc(Skill, 0);
+    const builtin = listSkills(allocator, builtin_dir, observer) catch try allocator.alloc(Skill, 0);
 
     // Load workspace skills
-    const workspace = listSkills(allocator, workspace_dir) catch try allocator.alloc(Skill, 0);
+    const workspace = listSkills(allocator, workspace_dir, observer) catch try allocator.alloc(Skill, 0);
 
     // Build a set of workspace skill names for override detection
     var ws_names = std.StringHashMap(void).init(allocator);
@@ -782,13 +800,11 @@ pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, w
 /// Detect whether source looks like a git remote URL/path.
 /// Accepted:
 /// - https://host/owner/repo(.git)
-/// - http://host/owner/repo(.git)
 /// - ssh://git@host/owner/repo(.git)
 /// - git://host/owner/repo(.git)
 /// - git@host:owner/repo(.git)
 fn isGitSource(source: []const u8) bool {
     return isGitSchemeSource(source, "https://") or
-        isGitSchemeSource(source, "http://") or
         isGitSchemeSource(source, "ssh://") or
         isGitSchemeSource(source, "git://") or
         isGitScpSource(source);
@@ -826,6 +842,97 @@ fn isGitScpSource(source: []const u8) bool {
         if (c == '/' or c == '\\') return false;
     }
     return true;
+}
+
+const WEB_SKILL_MANIFEST_PATH = "/.well-known/nullclaw-skill.json";
+const WEB_SKILL_DEFAULT_PATH = "/.well-known/skills/default/skill.md";
+const WEB_SKILL_FALLBACK_PATH = "/skill.md";
+
+fn isHttpSource(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "http://");
+}
+
+fn isHttpsSource(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "https://");
+}
+
+fn normalizeWebSkillSource(source: []const u8) []const u8 {
+    return std.mem.trimRight(u8, stripQueryAndFragment(std.mem.trim(u8, source, " \t\r\n")), "/");
+}
+
+fn stripWebSkillDiscoverySuffix(source: []const u8) []const u8 {
+    const normalized = normalizeWebSkillSource(source);
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_MANIFEST_PATH)) {
+        return normalized[0 .. normalized.len - WEB_SKILL_MANIFEST_PATH.len];
+    }
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_DEFAULT_PATH)) {
+        return normalized[0 .. normalized.len - WEB_SKILL_DEFAULT_PATH.len];
+    }
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_FALLBACK_PATH)) {
+        return normalized[0 .. normalized.len - WEB_SKILL_FALLBACK_PATH.len];
+    }
+    if (isHttpsSource(normalized) and isMarkdownFile(normalized)) {
+        const slash = std.mem.lastIndexOfScalar(u8, normalized, '/') orelse return normalized;
+        return normalized[0..slash];
+    }
+    return normalized;
+}
+
+fn buildWellKnownSkillUrls(allocator: std.mem.Allocator, source: []const u8) ![2][]u8 {
+    const normalized = normalizeWebSkillSource(source);
+    if (isHttpsSource(normalized) and isMarkdownFile(normalized)) {
+        return .{
+            try allocator.dupe(u8, normalized),
+            try allocator.dupe(u8, normalized),
+        };
+    }
+
+    const base = stripWebSkillDiscoverySuffix(source);
+    return .{
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, WEB_SKILL_DEFAULT_PATH }),
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, WEB_SKILL_FALLBACK_PATH }),
+    };
+}
+
+fn sanitizeWebSkillName(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const host = net_security.extractHost(source) orelse return allocator.dupe(u8, "web-skill");
+    var out = try allocator.alloc(u8, host.len);
+    var n: usize = 0;
+    for (host) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') {
+            out[n] = c;
+        } else {
+            out[n] = '-';
+        }
+        n += 1;
+    }
+    while (n > 0 and out[n - 1] == '-') n -= 1;
+    if (n == 0) {
+        allocator.free(out);
+        return allocator.dupe(u8, "web-skill");
+    }
+    return allocator.realloc(out, n);
+}
+
+const WebSkillManifest = struct {
+    name: ?[]const u8 = null,
+    skill_url: ?[]const u8 = null,
+};
+
+fn buildWellKnownSkillManifestUrl(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const normalized = normalizeWebSkillSource(source);
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_MANIFEST_PATH)) {
+        return allocator.dupe(u8, normalized);
+    }
+    const base = stripWebSkillDiscoverySuffix(source);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, WEB_SKILL_MANIFEST_PATH });
+}
+
+fn parseWebSkillManifest(json_bytes: []const u8) WebSkillManifest {
+    return .{
+        .name = json_miniparse.parseStringField(json_bytes, "name"),
+        .skill_url = json_miniparse.parseStringField(json_bytes, "skill_url"),
+    };
 }
 
 fn clearInstallErrorDetail(allocator: std.mem.Allocator, detail_out: ?*?[]u8) void {
@@ -1050,6 +1157,10 @@ fn stripQueryAndFragment(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '#')) |idx| end = @min(end, idx);
     if (std.mem.indexOfScalar(u8, target, '?')) |idx| end = @min(end, idx);
     return target[0..end];
+}
+
+fn isSafeHttpsSkillUrl(url: []const u8) bool {
+    return isHttpsSource(url) and isMarkdownFile(stripQueryAndFragment(url));
 }
 
 fn urlScheme(target: []const u8) ?[]const u8 {
@@ -1754,6 +1865,113 @@ fn installSkillFromGit(
 }
 
 /// Install a skill from either a local path or a git source URL, with optional error detail output.
+fn installSkillFromWellKnownUrl(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    // NOTE: No unit test for the live HTTP fetch path — it would require network I/O.
+    // Covered by deterministic tests for URL discovery helpers below and manual integration.
+    const manifest_url = try buildWellKnownSkillManifestUrl(allocator, source);
+    defer allocator.free(manifest_url);
+
+    var urls = try buildWellKnownSkillUrls(allocator, source);
+    defer allocator.free(urls[0]);
+    defer allocator.free(urls[1]);
+
+    var fetched_body: ?[]u8 = null;
+    var fetched_url: ?[]const u8 = null;
+    var installed_name: ?[]u8 = null;
+    defer if (fetched_body) |body| allocator.free(body);
+    defer if (installed_name) |name| allocator.free(name);
+
+    const timeout = "20";
+    const manifest_resp = http_util.curlGetWithStatusAndTimeout(allocator, manifest_url, &.{}, timeout) catch null;
+    if (manifest_resp) |resp| {
+        defer allocator.free(resp.body);
+        if (resp.status_code >= 200 and resp.status_code < 300) {
+            const manifest = parseWebSkillManifest(resp.body);
+            if (manifest.name) |name| {
+                try validateSkillName(name);
+                installed_name = try allocator.dupe(u8, name);
+            }
+            if (manifest.skill_url) |skill_url| {
+                if (!isSafeHttpsSkillUrl(skill_url)) {
+                    setInstallErrorDetail(allocator, detail_out, "web skill manifest returned an unsafe skill_url");
+                    return error.SkillSecurityAuditFailed;
+                }
+                allocator.free(urls[0]);
+                allocator.free(urls[1]);
+                urls = .{
+                    try allocator.dupe(u8, skill_url),
+                    try allocator.dupe(u8, skill_url),
+                };
+            }
+        }
+    }
+
+    for (urls) |candidate_url| {
+        const resp = http_util.curlGetWithStatusAndTimeout(allocator, candidate_url, &.{}, timeout) catch |err| switch (err) {
+            error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.CurlFailed, error.CurlReadError, error.CurlWaitError => {
+                setInstallErrorDetail(allocator, detail_out, "failed to fetch skill from web source");
+                return err;
+            },
+            else => return err,
+        };
+        defer allocator.free(resp.body);
+
+        if (resp.status_code == 404) continue;
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            const msg = try std.fmt.allocPrint(allocator, "web skill discovery failed: GET {s} returned HTTP {d}", .{ candidate_url, resp.status_code });
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+            return error.ManifestNotFound;
+        }
+
+        fetched_body = try allocator.dupe(u8, resp.body);
+        fetched_url = candidate_url;
+        break;
+    }
+
+    if (fetched_body == null) {
+        setInstallErrorDetail(allocator, detail_out, "web source did not expose /.well-known/skills/default/skill.md or /skill.md");
+        return error.ManifestNotFound;
+    }
+
+    const tmp_root = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_root);
+    const skill_dir_name = if (installed_name) |name|
+        try allocator.dupe(u8, name)
+    else
+        try sanitizeWebSkillName(allocator, source);
+    defer allocator.free(skill_dir_name);
+    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/nullclaw-skill-{x}", .{ tmp_root, std.hash.Wyhash.hash(0, source) });
+    defer allocator.free(temp_dir);
+    std.fs.deleteTreeAbsolute(temp_dir) catch {};
+    try fs_compat.makePath(temp_dir);
+    defer std.fs.deleteTreeAbsolute(temp_dir) catch {};
+
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{temp_dir});
+    defer allocator.free(skill_md_path);
+    const file = try std.fs.createFileAbsolute(skill_md_path, .{});
+    defer file.close();
+    try file.writeAll(fetched_body.?);
+
+    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_dir_name) catch |err| {
+        if (err == error.SkillAlreadyExists) {
+            const msg = try std.fmt.allocPrint(allocator, "skill '{s}' already exists", .{skill_dir_name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        } else if (fetched_url) |url| {
+            const msg = try std.fmt.allocPrint(allocator, "failed to install skill fetched from {s}: {s}", .{ url, @errorName(err) });
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        }
+        return err;
+    };
+}
+
 pub fn installSkillWithDetail(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1761,6 +1979,16 @@ pub fn installSkillWithDetail(
     detail_out: ?*?[]u8,
 ) !void {
     clearInstallErrorDetail(allocator, detail_out);
+    if (isHttpSource(source)) {
+        setInstallErrorDetail(allocator, detail_out, "skill install sources must use https://");
+        return error.SkillSecurityAuditFailed;
+    }
+    if (isHttpsSource(source)) {
+        installSkillFromWellKnownUrl(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
+            error.ManifestNotFound => {},
+            else => return err,
+        };
+    }
     if (isGitSource(source)) {
         return installSkillFromGit(allocator, source, workspace_dir, detail_out);
     }
@@ -1932,7 +2160,7 @@ pub fn syncCommunitySkills(allocator: std.mem.Allocator, workspace_dir: []const 
 
 /// Load community skills from .md files in the community directory.
 /// Returns owned slice; caller must free with freeSkills().
-pub fn loadCommunitySkills(allocator: std.mem.Allocator, community_dir: []const u8) ![]Skill {
+pub fn loadCommunitySkills(allocator: std.mem.Allocator, community_dir: []const u8, observer: ?observability.Observer) ![]Skill {
     var skills_list: std.ArrayList(Skill) = .empty;
     errdefer {
         for (skills_list.items) |*s| freeSkill(allocator, s);
@@ -1965,11 +2193,21 @@ pub fn loadCommunitySkills(allocator: std.mem.Allocator, community_dir: []const 
         const duped_ver = try allocator.dupe(u8, "0.0.1");
         errdefer allocator.free(duped_ver);
 
-        try skills_list.append(allocator, Skill{
+        const skill = Skill{
             .name = duped_name,
             .version = duped_ver,
             .instructions = content,
-        });
+        };
+
+        if (observer) |obs| {
+            const event = observability.ObserverEvent{ .skill_load = .{
+                .name = skill.name,
+                .duration_ms = 0,
+            } };
+            obs.recordEvent(&event);
+        }
+
+        try skills_list.append(allocator, skill);
     }
 
     return try skills_list.toOwnedSlice(allocator);
@@ -2269,7 +2507,7 @@ test "SkillManifest fields" {
 
 test "listSkills from nonexistent directory" {
     const allocator = std.testing.allocator;
-    const skills = try listSkills(allocator, "/tmp/nullclaw-test-skills-nonexistent-dir");
+    const skills = try listSkills(allocator, "/tmp/nullclaw-test-skills-nonexistent-dir", null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -2284,7 +2522,7 @@ test "listSkills from empty directory" {
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
-    const skills = try listSkills(allocator, base);
+    const skills = try listSkills(allocator, base, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -2324,7 +2562,7 @@ test "loadSkill reads manifest and instructions" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "test-skill" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("test-skill", skill.name);
@@ -2360,7 +2598,7 @@ test "loadSkill without SKILL.md still works" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "bare-skill" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("bare-skill", skill.name);
@@ -2385,7 +2623,7 @@ test "loadSkill without skill.json falls back to markdown-only skill" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "md-only" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("md-only", skill.name);
@@ -2417,7 +2655,7 @@ test "loadSkill reads metadata from SKILL.toml" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "toml-meta" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("from-toml", skill.name);
@@ -2452,7 +2690,7 @@ test "loadSkill prefers SKILL.toml metadata over skill.json" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "dual" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("toml-name", skill.name);
@@ -2467,7 +2705,7 @@ test "loadSkill missing manifest returns error" {
     const skill_dir = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(skill_dir);
 
-    try std.testing.expectError(error.ManifestNotFound, loadSkill(allocator, skill_dir));
+    try std.testing.expectError(error.ManifestNotFound, loadSkill(allocator, skill_dir, null));
 }
 
 test "listSkills discovers skills in subdirectories" {
@@ -2514,7 +2752,7 @@ test "listSkills discovers skills in subdirectories" {
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
-    const skills = try listSkills(allocator, base);
+    const skills = try listSkills(allocator, base, null);
     defer freeSkills(allocator, skills);
 
     try std.testing.expectEqual(@as(usize, 2), skills.len);
@@ -2545,7 +2783,7 @@ test "listSkills discovers markdown-only skill directories" {
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
-    const skills = try listSkills(allocator, base);
+    const skills = try listSkills(allocator, base, null);
     defer freeSkills(allocator, skills);
 
     try std.testing.expectEqual(@as(usize, 1), skills.len);
@@ -2581,7 +2819,7 @@ test "listSkills skips directories without valid manifest" {
     const base = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(base);
 
-    const skills = try listSkills(allocator, base);
+    const skills = try listSkills(allocator, base, null);
     defer freeSkills(allocator, skills);
 
     try std.testing.expectEqual(@as(usize, 1), skills.len);
@@ -2591,7 +2829,6 @@ test "listSkills skips directories without valid manifest" {
 test "isGitSource accepts remote protocols and scp style" {
     const sources = [_][]const u8{
         "https://github.com/some-org/some-skill.git",
-        "http://github.com/some-org/some-skill.git",
         "ssh://git@github.com/some-org/some-skill.git",
         "git://github.com/some-org/some-skill.git",
         "git@github.com:some-org/some-skill.git",
@@ -2608,6 +2845,7 @@ test "isGitSource rejects local paths and invalid inputs" {
         "./skills/local-skill",
         "/tmp/skills/local-skill",
         "C:\\skills\\local-skill",
+        "http://github.com/some-org/some-skill.git",
         "git@github.com",
         "ssh://",
         "not-a-url",
@@ -2617,6 +2855,91 @@ test "isGitSource rejects local paths and invalid inputs" {
     for (sources) |source| {
         try std.testing.expect(!isGitSource(source));
     }
+}
+
+test "source scheme helpers distinguish https from insecure http" {
+    try std.testing.expect(isHttpsSource("https://example.com"));
+    try std.testing.expect(!isHttpsSource("http://example.com/docs"));
+    try std.testing.expect(isHttpSource("http://example.com/docs"));
+    try std.testing.expect(!isHttpSource("https://example.com"));
+    try std.testing.expect(!isHttpSource("git@github.com:owner/repo.git"));
+    try std.testing.expect(!isHttpSource("./skills/demo"));
+}
+
+test "buildWellKnownSkillUrls appends default discovery paths" {
+    const urls = try buildWellKnownSkillUrls(std.testing.allocator, "https://example.com/docs");
+    defer std.testing.allocator.free(urls[0]);
+    defer std.testing.allocator.free(urls[1]);
+
+    try std.testing.expectEqualStrings("https://example.com/docs/.well-known/skills/default/skill.md", urls[0]);
+    try std.testing.expectEqualStrings("https://example.com/docs/skill.md", urls[1]);
+}
+
+test "buildWellKnownSkillUrls preserves direct skill URL" {
+    const urls = try buildWellKnownSkillUrls(std.testing.allocator, "https://example.com/.well-known/skills/default/skill.md");
+    defer std.testing.allocator.free(urls[0]);
+    defer std.testing.allocator.free(urls[1]);
+
+    try std.testing.expectEqualStrings("https://example.com/.well-known/skills/default/skill.md", urls[0]);
+    try std.testing.expectEqualStrings("https://example.com/.well-known/skills/default/skill.md", urls[1]);
+}
+
+test "buildWellKnownSkillUrls rewrites direct manifest URL to skill discovery paths" {
+    const urls = try buildWellKnownSkillUrls(std.testing.allocator, "https://example.com/.well-known/nullclaw-skill.json");
+    defer std.testing.allocator.free(urls[0]);
+    defer std.testing.allocator.free(urls[1]);
+
+    try std.testing.expectEqualStrings("https://example.com/.well-known/skills/default/skill.md", urls[0]);
+    try std.testing.expectEqualStrings("https://example.com/skill.md", urls[1]);
+}
+
+test "sanitizeWebSkillName derives safe host-based install name" {
+    const name = try sanitizeWebSkillName(std.testing.allocator, "https://docs.example.com/path");
+    defer std.testing.allocator.free(name);
+
+    try std.testing.expectEqualStrings("docs.example.com", name);
+}
+
+test "buildWellKnownSkillManifestUrl appends manifest path" {
+    const url = try buildWellKnownSkillManifestUrl(std.testing.allocator, "https://example.com/docs");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://example.com/docs/.well-known/nullclaw-skill.json", url);
+}
+
+test "buildWellKnownSkillManifestUrl strips direct skill path and query" {
+    const url = try buildWellKnownSkillManifestUrl(std.testing.allocator, "https://example.com/docs/skill.markdown?download=1");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://example.com/docs/.well-known/nullclaw-skill.json", url);
+}
+
+test "parseWebSkillManifest reads name and skill_url" {
+    const manifest = parseWebSkillManifest(
+        \\{"name":"demo-skill","skill_url":"https://example.com/skill.md"}
+    );
+    try std.testing.expectEqualStrings("demo-skill", manifest.name.?);
+    try std.testing.expectEqualStrings("https://example.com/skill.md", manifest.skill_url.?);
+}
+
+test "isSafeHttpsSkillUrl requires https markdown URL" {
+    try std.testing.expect(isSafeHttpsSkillUrl("https://example.com/skill.md"));
+    try std.testing.expect(isSafeHttpsSkillUrl("https://example.com/skill.markdown?download=1"));
+    try std.testing.expect(!isSafeHttpsSkillUrl("http://example.com/skill.md"));
+    try std.testing.expect(!isSafeHttpsSkillUrl("https://example.com/skill.json"));
+}
+
+test "installSkillWithDetail rejects insecure http source before any network I/O" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_dir);
+
+    try std.testing.expectError(
+        error.SkillSecurityAuditFailed,
+        installSkillWithDetail(std.testing.allocator, "http://example.com/skill.md", workspace_dir, null),
+    );
 }
 
 test "classifyGitCloneError maps common git clone failures" {
@@ -3056,7 +3379,7 @@ test "installSkill and removeSkill roundtrip" {
     try installSkill(allocator, source, workspace);
 
     // Verify installed skill loads
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("installable", skills[0].name);
@@ -3066,7 +3389,7 @@ test "installSkill and removeSkill roundtrip" {
     try removeSkill(allocator, "source", workspace);
 
     // Verify removal
-    const after = try listSkills(allocator, workspace);
+    const after = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
@@ -3297,7 +3620,7 @@ test "installSkillFromPath supports SKILL.toml-only source directory" {
     defer allocator.free(installed_toml);
     try std.testing.expect(pathExists(installed_toml));
 
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("example-skill", skills[0].name);
@@ -3342,7 +3665,7 @@ test "installSkillFromGit installs from local git repository" {
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("git-install", skills[0].name);
@@ -3380,7 +3703,7 @@ test "installSkillFromGit supports root markdown-only repository" {
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("repo", skills[0].name);
@@ -3427,7 +3750,7 @@ test "installSkillFromGit installs all skills from repository skills directory" 
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 2), skills.len);
 
@@ -3484,7 +3807,7 @@ test "installSkillFromGit installs SKILL.toml entry from repository skills direc
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 1), skills.len);
     try std.testing.expectEqualStrings("toml-only", skills[0].name);
@@ -3588,7 +3911,7 @@ test "installSkillFromGit continues installing when one skill fails" {
     try installSkillFromGit(allocator, repo, workspace, null);
 
     // Only another_good should be installed (good_skill failed due to existing)
-    const skills = try listSkills(allocator, workspace);
+    const skills = try listSkills(allocator, workspace, null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 2), skills.len);
 
@@ -3803,7 +4126,7 @@ test "syncCommunitySkills disabled when env not set" {
 
 test "loadCommunitySkills from nonexistent directory" {
     const allocator = std.testing.allocator;
-    const skills = try loadCommunitySkills(allocator, "/tmp/nullclaw-test-community-nonexistent");
+    const skills = try loadCommunitySkills(allocator, "/tmp/nullclaw-test-community-nonexistent", null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -3843,7 +4166,7 @@ test "loadCommunitySkills loads .md files" {
     const community_dir = try std.fs.path.join(allocator, &.{ base, "community" });
     defer allocator.free(community_dir);
 
-    const skills = try loadCommunitySkills(allocator, community_dir);
+    const skills = try loadCommunitySkills(allocator, community_dir, null);
     defer freeSkills(allocator, skills);
 
     try std.testing.expectEqual(@as(usize, 2), skills.len);
@@ -4081,7 +4404,7 @@ test "loadSkill reads always field" {
     const skill_dir = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expect(skill.always);
@@ -4156,7 +4479,7 @@ test "listSkillsMerged workspace overrides builtin" {
     const ws_base = try std.fs.path.join(allocator, &.{ base, "workspace" });
     defer allocator.free(ws_base);
 
-    const skills = try listSkillsMerged(allocator, builtin_base, ws_base);
+    const skills = try listSkillsMerged(allocator, builtin_base, ws_base, null);
     defer freeSkills(allocator, skills);
 
     // Should have 3 skills: builtin-only, shared (ws version), ws-only
@@ -4178,7 +4501,7 @@ test "listSkillsMerged workspace overrides builtin" {
 
 test "listSkillsMerged with nonexistent dirs returns empty" {
     const allocator = std.testing.allocator;
-    const skills = try listSkillsMerged(allocator, "/tmp/nullclaw-nonexistent-a", "/tmp/nullclaw-nonexistent-b");
+    const skills = try listSkillsMerged(allocator, "/tmp/nullclaw-nonexistent-a", "/tmp/nullclaw-nonexistent-b", null);
     defer freeSkills(allocator, skills);
     try std.testing.expectEqual(@as(usize, 0), skills.len);
 }
@@ -4250,7 +4573,7 @@ test "listSkillsMerged runs checkRequirements" {
     const ws_base = try std.fs.path.join(allocator, &.{ base, "workspace" });
     defer allocator.free(ws_base);
 
-    const skills = try listSkillsMerged(allocator, builtin_base, ws_base);
+    const skills = try listSkillsMerged(allocator, builtin_base, ws_base, null);
     defer freeSkills(allocator, skills);
 
     try std.testing.expectEqual(@as(usize, 1), skills.len);
@@ -4649,7 +4972,7 @@ test "loadSkill SKILL.md with frontmatter populates manifest" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "fm-skill" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("from-frontmatter", skill.name);
@@ -4678,7 +5001,7 @@ test "loadSkill SKILL.md frontmatter without name falls back to dirname" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "dirname-fallback" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     // Name falls back to directory name
@@ -4706,7 +5029,7 @@ test "loadSkill SKILL.md without frontmatter unchanged behavior" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "no-fm" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("no-fm", skill.name);
@@ -4732,7 +5055,7 @@ test "loadSkill SKILL.md frontmatter with requires_bins" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "bins-skill" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("bins-skill", skill.name);
@@ -4768,7 +5091,7 @@ test "loadSkill SKILL.md frontmatter requires_bins ignores comments" {
     const skill_dir = try std.fs.path.join(allocator, &.{ base, "skills", "commented-bins" });
     defer allocator.free(skill_dir);
 
-    const skill = try loadSkill(allocator, skill_dir);
+    const skill = try loadSkill(allocator, skill_dir, null);
     defer freeSkill(allocator, &skill);
 
     try std.testing.expectEqualStrings("commented-bins", skill.name);

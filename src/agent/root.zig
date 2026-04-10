@@ -1679,6 +1679,7 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+                .observer = self.observer,
             });
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {
@@ -1799,6 +1800,7 @@ pub const Agent = struct {
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
@@ -1827,6 +1829,7 @@ pub const Agent = struct {
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
@@ -1863,6 +1866,7 @@ pub const Agent = struct {
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1881,6 +1885,7 @@ pub const Agent = struct {
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
+                    .reasoning_content = stream_result.reasoning_content,
                     .tool_calls = &.{},
                     .usage = stream_result.usage,
                     .model = stream_result.model,
@@ -1899,6 +1904,7 @@ pub const Agent = struct {
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
@@ -1934,6 +1940,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1972,6 +1979,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -2004,6 +2012,7 @@ pub const Agent = struct {
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
+                            .include_reasoning = include_reasoning,
                         },
                         turn_model_name,
                         self.temperature,
@@ -2033,6 +2042,7 @@ pub const Agent = struct {
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
+                                    .include_reasoning = include_reasoning,
                                 },
                                 turn_model_name,
                                 self.temperature,
@@ -2485,6 +2495,7 @@ pub const Agent = struct {
 
     fn tool_call_updates_tools_md(allocator: std.mem.Allocator, call: ParsedToolCall) bool {
         if (!std.mem.eql(u8, call.name, "file_write") and
+            !std.mem.eql(u8, call.name, "file_append") and
             !std.mem.eql(u8, call.name, "file_edit") and
             !std.mem.eql(u8, call.name, "file_edit_hashed")) return false;
 
@@ -2577,6 +2588,14 @@ pub const Agent = struct {
         call: ParsedToolCall,
         result: ToolExecutionResult,
     ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
@@ -2949,8 +2968,10 @@ pub const Agent = struct {
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
+        const reasoning_returned = response.reasoning_content != null and response.reasoning_content.?.len > 0;
+        const reasoning_requested = self.reasoning_mode != .off;
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} reasoning_mode={s} reasoning_effort={s} reasoning_requested={} reasoning_returned={} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
@@ -2959,11 +2980,32 @@ pub const Agent = struct {
                 self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
+                self.reasoning_mode.toSlice(),
+                self.reasoning_effort orelse "off",
+                reasoning_requested,
+                reasoning_returned,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
                 if (preview.truncated) " [log preview truncated]" else "",
             },
         );
+
+        // NOTE: Logging-only path. No direct unit test added because verifying structured
+        // log emission here would require a log sink harness for Agent runtime logging.
+        if (reasoning_requested and !reasoning_returned) {
+            log.info(
+                "llm response reasoning missing session=0x{x} iter={d} attempt={d} provider={s} model={s} reasoning_mode={s} reasoning_effort={s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    self.effectiveProvider(response),
+                    self.effectiveModel(response),
+                    self.reasoning_mode.toSlice(),
+                    self.reasoning_effort orelse "off",
+                },
+            );
+        }
 
         if (response.reasoning_content) |reasoning| {
             const r_preview = llmLogPreview(reasoning);
@@ -3646,6 +3688,10 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
         fn supportsVisionForModel(_: *anyopaque, model: []const u8) bool {
             return std.mem.eql(u8, model, "vision-model");
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -3723,6 +3769,10 @@ test "Agent buildProviderMessages allows workspace image paths" {
         fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
             return true;
         }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -3905,6 +3955,10 @@ fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy-test-provider";
         }
@@ -3965,6 +4019,8 @@ const RecordingObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = getName,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     fn observer(self: *Self) Observer {
@@ -4010,6 +4066,10 @@ const RecordingObserver = struct {
 
     fn flush(_: *anyopaque) void {}
 
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn getName(_: *anyopaque) []const u8 {
         return "recording-test";
     }
@@ -4114,6 +4174,10 @@ test "turn prepends profile system prompt when profile is active" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-profile-provider";
         }
@@ -4580,6 +4644,10 @@ test "turn bare /new routes through fresh-session prompt" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "echo-provider";
         }
@@ -4652,6 +4720,10 @@ test "turn /reset with argument stays slash-only command" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "nocall-provider";
         }
@@ -4716,6 +4788,10 @@ test "turn retains user message on provider error" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "fail-provider";
         }
@@ -4789,6 +4865,10 @@ test "turn does not retry immediately on rate limit" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "rate-limited-provider";
         }
@@ -4859,6 +4939,10 @@ test "turn still retries non-rate-limited provider failures once" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "retry-provider";
         }
@@ -4936,6 +5020,10 @@ test "turn records llm request for immediate context-compaction retry" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "recovery-provider";
         }
@@ -5116,6 +5204,7 @@ test "slash /model with telegram bot mention switches model" {
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.default_model);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
 }
 
@@ -5130,7 +5219,31 @@ test "slash /model resolves provider max_tokens fallback" {
 
     try std.testing.expect(std.mem.indexOf(u8, response, "qianfan/custom-model") != null);
     try std.testing.expectEqualStrings("qianfan/custom-model", agent.model_name);
+    try std.testing.expectEqualStrings("qianfan", agent.default_provider);
     try std.testing.expectEqual(@as(u32, 32_768), agent.max_tokens);
+}
+
+test "slash /model preserves custom provider prefix when switching explicit provider model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.max_tokens = 111;
+
+    const response = (try agent.handleSlashCommand(
+        "/model custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+    )).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model") != null);
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.model_name,
+    );
+    try std.testing.expectEqualStrings(
+        "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model",
+        agent.default_model,
+    );
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2", agent.default_provider);
 }
 
 test "slash /model keeps explicit token_limit override" {
@@ -5460,6 +5573,94 @@ test "slash /model without name shows current" {
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
+}
+
+test "slash /model renders interactive choices for telegram sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
+}
+
+test "slash /model provider renders interactive model choices for selected provider" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model provider anthropic")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model with a single configured provider renders models directly" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+    };
+    agent.memory_session_id = "telegram:chat123";
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model claude-sonnet-4-6") != null);
+}
+
+test "slash /model renders interactive choices for routed slack sessions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    const configured_providers = [_]config_types.ProviderEntry{
+        .{ .name = "anthropic" },
+        .{ .name = "openai" },
+    };
+    agent.memory_session_id = "agent:slack-ops:main";
+    agent.conversation_context = .{ .channel = "slack" };
+    agent.default_provider = "anthropic";
+    agent.model_name = "claude-opus-4-6";
+    agent.default_model = "claude-opus-4-6";
+    agent.configured_providers = &configured_providers;
+
+    const response = (try agent.handleSlashCommand("/model")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Choose a provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/model provider anthropic") != null);
 }
 
 test "slash /models aliases to /model" {
@@ -5839,6 +6040,10 @@ test "hard stop mock interruption lists exactly interrupted tool" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "one-shot-tool-provider";
         }
@@ -6009,6 +6214,10 @@ test "turn includes reasoning and usage footer when enabled" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6053,7 +6262,7 @@ test "turn includes reasoning and usage footer when enabled" {
     const response = try agent.turn("hello");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\n> thinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
 }
@@ -6077,6 +6286,10 @@ test "turn estimates token usage when provider omits usage" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "test";
         }
@@ -6145,6 +6358,10 @@ test "turn refreshes system prompt after workspace markdown change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6232,6 +6449,10 @@ test "turn refreshes system prompt after TOOLS.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6319,6 +6540,10 @@ test "turn refreshes system prompt after USER.md change" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6406,6 +6631,10 @@ test "turn refreshes system prompt when conversation sender changes" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "reload-provider";
         }
@@ -6958,6 +7187,10 @@ test "turn passes auto-routed model to provider" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "capture-provider";
         }
@@ -7028,6 +7261,11 @@ test "tool_call_batch_updates_tools_md detects writes to TOOLS.md" {
         .{ .name = "file_edit_hashed", .arguments_json = "{\"path\":\"notes/TOOLS.md\",\"target\":\"L1:abc\",\"new_text\":\"b\"}" },
     };
     try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_match));
+
+    const calls_append_match = [_]ParsedToolCall{
+        .{ .name = "file_append", .arguments_json = "{\"path\":\"./config/TOOLS.md\",\"content\":\"\\nmore guidance\"}" },
+    };
+    try std.testing.expect(Agent.tool_call_batch_updates_tools_md(allocator, &calls_append_match));
 
     const calls_no_match = [_]ParsedToolCall{
         .{ .name = "file_write", .arguments_json = "{\"path\":\"README.md\",\"content\":\"x\"}" },
@@ -7132,6 +7370,27 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
 }
 
+test "rememberToolCallResultInTurn skips failed signature-only calls" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const failed_call = ParsedToolCall{
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"missing.txt\"}",
+        .tool_call_id = null,
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+        .name = failed_call.name,
+        .output = "FileNotFound",
+        .success = false,
+        .tool_call_id = null,
+    });
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
+}
+
 test "Agent turn skips replayed tool_call_id across iterations" {
     const ProbeTool = struct {
         const Self = @This();
@@ -7192,6 +7451,10 @@ test "Agent turn skips replayed tool_call_id across iterations" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "replay-provider";
         }
@@ -7340,6 +7603,10 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -7467,6 +7734,10 @@ test "Agent tool-limit summary preserves provider session_id" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "session-capture-provider";
         }
@@ -7584,6 +7855,10 @@ test "Agent tool-limit summary records observer events and token metric" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-provider";
         }
@@ -7704,6 +7979,10 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "summary-fail-provider";
         }
@@ -7801,6 +8080,10 @@ test "bindMemoryTools wires memory tools to sqlite backend" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "dummy";
         }
@@ -7919,6 +8202,10 @@ test "Agent tool loop frees dynamic tool outputs" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "step-provider";
         }
@@ -8058,6 +8345,10 @@ test "Agent shell failure with normalized output does not poison next turn" {
             return true;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "shell-failure-provider";
         }
@@ -8171,6 +8462,10 @@ test "Agent strips fabricated tool_result blocks from XML assistant history" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "xml-fabrication-provider";
         }
@@ -8306,6 +8601,10 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
             return error.ShouldNotStream;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "stream-guard";
         }
@@ -8471,6 +8770,10 @@ test "Agent retries empty final response once before succeeding" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-provider";
         }
@@ -8540,6 +8843,10 @@ test "Agent returns NoResponseContent after repeated empty final responses" {
             return false;
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "always-empty-provider";
         }
@@ -8643,6 +8950,10 @@ test "Agent retries empty streaming response once" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "empty-then-recovered-streaming-provider";
         }
@@ -8776,6 +9087,10 @@ test "Agent forces follow-through retry for streaming deferred promise" {
             };
         }
 
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
         fn getName(_: *anyopaque) []const u8 {
             return "deferred-promise-streaming-provider";
         }
