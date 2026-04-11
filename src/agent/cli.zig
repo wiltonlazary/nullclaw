@@ -32,6 +32,7 @@ const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
+const commands = @import("commands.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -58,6 +59,35 @@ const CliProviderContext = struct {
 
 fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
     return !supports_streaming or !emitted_text;
+}
+
+fn persistedAssistantReply(agent: anytype, response: []const u8) []const u8 {
+    if (agent.history.items.len == 0) return response;
+    const last = agent.history.items[agent.history.items.len - 1];
+    if (last.role != .assistant) return response;
+    return last.content;
+}
+
+fn persistCliTurn(agent: anytype, session_key: ?[]const u8, content: []const u8, response: []const u8) void {
+    const store = agent.session_store orelse return;
+    const sid = session_key orelse return;
+    const turn_input = commands.planTurnInput(content);
+
+    if (turn_input.clear_session) {
+        store.clearMessages(sid) catch {};
+        store.clearAutoSaved(sid) catch {};
+    }
+
+    if (commands.persistedRuntimeCommand(content)) |runtime_command| {
+        store.saveMessage(sid, memory_mod.RUNTIME_COMMAND_ROLE, runtime_command) catch {};
+    }
+
+    if (turn_input.llm_user_message) |persisted_user| {
+        const persisted_assistant = persistedAssistantReply(agent, response);
+        store.saveMessage(sid, "user", persisted_user) catch {};
+        store.saveMessage(sid, "assistant", persisted_assistant) catch {};
+        store.saveUsage(sid, agent.total_tokens) catch {};
+    }
 }
 
 fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
@@ -533,6 +563,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
+        persistCliTurn(&agent, agent.memory_session_id, message, response);
+
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
         } else {
@@ -682,6 +714,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             continue;
         };
         defer allocator.free(response);
+
+        persistCliTurn(&agent, agent.memory_session_id, debounced_input.current, response);
 
         if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("\n{s}\n\n", .{response});
@@ -1012,4 +1046,88 @@ test "writeRateLimitHint mentions reliability knobs and logs" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "reliability.provider_backoff_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "~/.nullclaw/logs/daemon.stdout.log") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "kimi appears rate-limited or quota-constrained") != null);
+}
+
+test "persistCliTurn stores user and assistant messages in session history" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    var dummy = struct {
+        session_store: ?memory_mod.SessionStore,
+        history: std.ArrayListUnmanaged(Agent.OwnedMessage),
+        total_tokens: u64,
+    }{
+        .session_store = store,
+        .history = .empty,
+        .total_tokens = 42,
+    };
+    defer {
+        for (dummy.history.items) |msg| msg.deinit(allocator);
+        dummy.history.deinit(allocator);
+    }
+
+    try dummy.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "pong"),
+    });
+
+    persistCliTurn(&dummy, "test-cli-session", "ping", "pong");
+
+    const sessions = try store.listSessions(allocator, 10, 0);
+    defer memory_mod.freeSessionInfos(allocator, sessions);
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("test-cli-session", sessions[0].session_id);
+    try std.testing.expectEqual(@as(u64, 2), sessions[0].message_count);
+
+    const detailed = try store.loadMessagesDetailed(allocator, "test-cli-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings("ping", detailed[0].content);
+    try std.testing.expectEqualStrings("assistant", detailed[1].role);
+    try std.testing.expectEqualStrings("pong", detailed[1].content);
+    try std.testing.expectEqual(@as(?u64, 42), try store.loadUsage("test-cli-session"));
+}
+
+test "persistCliTurn clears prior session history on reset" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try store.saveMessage("test-cli-session", "user", "old");
+    try store.saveMessage("test-cli-session", "assistant", "history");
+
+    var dummy = struct {
+        session_store: ?memory_mod.SessionStore,
+        history: std.ArrayListUnmanaged(Agent.OwnedMessage),
+        total_tokens: u64,
+    }{
+        .session_store = store,
+        .history = .empty,
+        .total_tokens = 7,
+    };
+    defer {
+        for (dummy.history.items) |msg| msg.deinit(allocator);
+        dummy.history.deinit(allocator);
+    }
+
+    try dummy.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "fresh reply"),
+    });
+
+    // Regression: CLI turns with explicit session ids must update the session-store
+    // history tables, not just the memories table, so `history list/show` stays populated.
+    persistCliTurn(&dummy, "test-cli-session", "/reset", "fresh reply");
+
+    const detailed = try store.loadMessagesDetailed(allocator, "test-cli-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 2), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings(commands.BARE_SESSION_RESET_PROMPT, detailed[0].content);
+    try std.testing.expectEqualStrings("assistant", detailed[1].role);
+    try std.testing.expectEqualStrings("fresh reply", detailed[1].content);
 }
