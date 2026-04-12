@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
+const net_security = @import("net_security.zig");
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
@@ -75,6 +76,63 @@ pub const HttpResponseWithHeaders = struct {
     body: []u8,
 };
 
+pub const SafeResolveEntryError = Allocator.Error || error{
+    InvalidUrl,
+    LocalAddressBlocked,
+    HostResolutionFailed,
+};
+
+fn defaultPortForScheme(uri: std.Uri) ?u16 {
+    if (uri.port) |port| return port;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return 443;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http")) return 80;
+    return null;
+}
+
+fn shouldUseCurlResolve(host: []const u8) bool {
+    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
+}
+
+fn shouldUsePinnedResolve(host: []const u8, connect_host: []const u8) bool {
+    return shouldUseCurlResolve(host) and !std.mem.eql(u8, host, connect_host);
+}
+
+fn buildCurlResolveEntry(
+    allocator: Allocator,
+    host: []const u8,
+    port: u16,
+    connect_host: []const u8,
+) ![]u8 {
+    const host_for_resolve = net_security.stripHostBrackets(host);
+    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
+    else
+        try allocator.dupe(u8, connect_host);
+    defer allocator.free(connect_target);
+
+    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
+}
+
+/// Build an optional curl `--resolve` entry for remote provider requests.
+/// Remote hosts are pinned to a concrete globally-routable address; explicit
+/// local/private hosts are left untouched so intentional local providers still work.
+pub fn buildSafeResolveEntryForRemoteUrl(
+    allocator: Allocator,
+    url: []const u8,
+) SafeResolveEntryError!?[]u8 {
+    const uri = std.Uri.parse(url) catch return error.InvalidUrl;
+    const port = defaultPortForScheme(uri) orelse return error.InvalidUrl;
+    const host = net_security.extractHost(url) orelse return error.InvalidUrl;
+
+    if (net_security.isLocalHost(host)) return null;
+
+    const connect_host = try net_security.resolveConnectHost(allocator, host, port);
+    defer allocator.free(connect_host);
+
+    if (!shouldUsePinnedResolve(host, connect_host)) return null;
+    return try buildCurlResolveEntry(allocator, host, port, connect_host);
+}
+
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
@@ -89,6 +147,18 @@ pub fn curlPostWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
+    return curlPostWithProxyAndResolve(allocator, url, body, headers, proxy, max_time, null);
+}
+
+pub fn curlPostWithProxyAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) ![]u8 {
     return curlRequestWithProxy(
         allocator,
         "POST",
@@ -98,6 +168,7 @@ pub fn curlPostWithProxy(
         headers,
         proxy,
         max_time,
+        resolve_entry,
     );
 }
 
@@ -110,6 +181,17 @@ pub fn curlPostFormWithProxy(
     proxy: ?[]const u8,
     max_time: ?[]const u8,
 ) ![]u8 {
+    return curlPostFormWithProxyAndResolve(allocator, url, body, proxy, max_time, null);
+}
+
+pub fn curlPostFormWithProxyAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    proxy: ?[]const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) ![]u8 {
     return curlRequestWithProxy(
         allocator,
         "POST",
@@ -119,6 +201,7 @@ pub fn curlPostFormWithProxy(
         &.{},
         proxy,
         max_time,
+        resolve_entry,
     );
 }
 
@@ -131,6 +214,7 @@ fn curlRequestWithProxy(
     headers: []const []const u8,
     proxy: ?[]const u8,
     max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
 ) ![]u8 {
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
@@ -152,6 +236,13 @@ fn curlRequestWithProxy(
         argv_buf[argc] = "--proxy";
         argc += 1;
         argv_buf[argc] = p;
+        argc += 1;
+    }
+
+    if (resolve_entry) |entry| {
+        argv_buf[argc] = "--resolve";
+        argc += 1;
+        argv_buf[argc] = entry;
         argc += 1;
     }
 
@@ -282,6 +373,17 @@ pub fn curlPostWithStatusAndTimeout(
     headers: []const []const u8,
     max_time: ?[]const u8,
 ) !HttpResponse {
+    return curlPostWithStatusAndTimeoutAndResolve(allocator, url, body, headers, max_time, null);
+}
+
+pub fn curlPostWithStatusAndTimeoutAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) !HttpResponse {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -294,6 +396,13 @@ pub fn curlPostWithStatusAndTimeout(
         argv_buf[argc] = "--max-time";
         argc += 1;
         argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    if (resolve_entry) |entry| {
+        argv_buf[argc] = "--resolve";
+        argc += 1;
+        argv_buf[argc] = entry;
         argc += 1;
     }
 
@@ -403,6 +512,17 @@ pub fn curlPostWithStatusHeadersAndTimeout(
     headers: []const []const u8,
     max_time: ?[]const u8,
 ) !HttpResponseWithHeaders {
+    return curlPostWithStatusHeadersAndTimeoutAndResolve(allocator, url, body, headers, max_time, null);
+}
+
+pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) !HttpResponseWithHeaders {
     var argv_buf: [56][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -415,6 +535,13 @@ pub fn curlPostWithStatusHeadersAndTimeout(
         argv_buf[argc] = "--max-time";
         argc += 1;
         argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    if (resolve_entry) |entry| {
+        argv_buf[argc] = "--resolve";
+        argc += 1;
+        argv_buf[argc] = entry;
         argc += 1;
     }
 
@@ -542,6 +669,16 @@ pub fn curlGetWithStatusAndTimeout(
     headers: []const []const u8,
     max_time: ?[]const u8,
 ) !HttpResponse {
+    return curlGetWithStatusAndTimeoutAndResolve(allocator, url, headers, max_time, null);
+}
+
+pub fn curlGetWithStatusAndTimeoutAndResolve(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+    resolve_entry: ?[]const u8,
+) !HttpResponse {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
 
@@ -554,6 +691,13 @@ pub fn curlGetWithStatusAndTimeout(
         argv_buf[argc] = "--max-time";
         argc += 1;
         argv_buf[argc] = mt;
+        argc += 1;
+    }
+
+    if (resolve_entry) |entry| {
+        argv_buf[argc] = "--resolve";
+        argc += 1;
+        argv_buf[argc] = entry;
         argc += 1;
     }
 
@@ -632,6 +776,7 @@ pub fn curlPut(allocator: Allocator, url: []const u8, body: []const u8, headers:
         url,
         body,
         headers,
+        null,
         null,
         null,
     );
@@ -957,6 +1102,18 @@ test "curlGetWithResolve compiles and is callable" {
 
 test "curlGetMaxBytes compiles and is callable" {
     _ = curlGetMaxBytes;
+}
+
+test "buildSafeResolveEntryForRemoteUrl allows explicit local host without pinning" {
+    try std.testing.expect((try buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "http://127.0.0.1:11434/api/chat")) == null);
+}
+
+test "buildSafeResolveEntryForRemoteUrl rejects loopback integer alias" {
+    try std.testing.expectError(error.LocalAddressBlocked, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "https://2130706433/v1"));
+}
+
+test "buildSafeResolveEntryForRemoteUrl rejects malformed URL" {
+    try std.testing.expectError(error.InvalidUrl, buildSafeResolveEntryForRemoteUrl(std.testing.allocator, "notaurl"));
 }
 
 test "curl post max bytes is increased for large provider responses" {
