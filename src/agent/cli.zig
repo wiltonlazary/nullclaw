@@ -40,15 +40,11 @@ const CliStreamCtx = struct {
 };
 
 const CliProviderContext = struct {
-    provider: Provider,
-    holder: ?providers.ProviderHolder = null,
+    holder: providers.ProviderHolder,
     owned_api_key: ?[]u8 = null,
 
     fn deinit(self: *CliProviderContext, allocator: std.mem.Allocator) void {
-        if (self.holder) |*holder| {
-            holder.deinit();
-            self.holder = null;
-        }
+        self.holder.deinit();
         if (self.owned_api_key) |api_key| {
             allocator.free(api_key);
             self.owned_api_key = null;
@@ -240,7 +236,7 @@ fn resolveProfileProvider(
         break :blk owned_api_key;
     };
 
-    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+    const holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
         profile.provider,
         provider_api_key,
@@ -253,7 +249,6 @@ fn resolveProfileProvider(
         cfg.getProviderExtraBodyParams(profile.provider),
     );
     return .{
-        .provider = holder.provider(),
         .holder = holder,
         .owned_api_key = owned_api_key,
     };
@@ -466,7 +461,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
 
-    const provider_i: Provider = if (provider_ctx) |ctx| ctx.provider else runtime_provider.?.provider();
+    const provider_i: Provider = if (provider_ctx) |*ctx| ctx.holder.provider() else runtime_provider.?.provider();
 
     const supports_streaming = provider_i.supportsStreaming();
 
@@ -913,6 +908,33 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
     try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
+}
+
+test "resolveProfileProvider returns provider from returned holder storage" {
+    var cfg = Config{
+        .allocator = std.testing.allocator,
+        .workspace_dir = "/tmp/nullclaw-cli-test",
+        .config_path = "/tmp/nullclaw-cli-test/config.json",
+        .providers = &.{
+            .{
+                .name = "custom:dmr",
+                .base_url = "http://127.0.0.1:8080/v1",
+            },
+        },
+    };
+    const profile = config_types.NamedAgentConfig{
+        .name = "sub",
+        .provider = "custom:dmr",
+        .model = "smollm2",
+        .api_key = "placeholder",
+    };
+
+    var ctx = try resolveProfileProvider(std.testing.allocator, &cfg, profile);
+    defer ctx.deinit(std.testing.allocator);
+
+    const provider = ctx.holder.provider();
+    try std.testing.expect(@intFromPtr(provider.ptr) != 0);
+    try std.testing.expect(@intFromPtr(provider.vtable) != 0);
 }
 
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {

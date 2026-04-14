@@ -142,7 +142,7 @@ fn findProfileForSessionKey(config: *const Config, session_key: []const u8) ?con
 }
 
 const SessionProviderContext = struct {
-    provider: Provider,
+    provider: ?Provider = null,
     holder: ?providers.ProviderHolder = null,
     owned_api_key: ?[]u8 = null,
 
@@ -1340,7 +1340,7 @@ pub const SessionManager = struct {
         const session_provider = if (session.provider_holder) |*holder|
             holder.provider()
         else
-            provider_ctx.provider;
+            provider_ctx.provider.?;
 
         var agent = try Agent.fromConfigWithProfile(
             self.allocator,
@@ -1427,7 +1427,7 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        const holder = providers.ProviderHolder.fromConfigWithApiMode(
             self.allocator,
             profile.provider,
             provider_api_key,
@@ -1440,7 +1440,6 @@ pub const SessionManager = struct {
             self.config.getProviderExtraBodyParams(profile.provider),
         );
         return .{
-            .provider = holder.provider(),
             .holder = holder,
             .owned_api_key = owned_api_key,
         };
@@ -2390,6 +2389,35 @@ test "probeVision uses vision route model ref and gateway timeout" {
     try testing.expectEqual(@as(usize, 1), mock.chat_calls);
     try testing.expectEqualStrings("openrouter/openai/gpt-4.1", mock.lastChatModel());
     try testing.expectEqual(@as(u64, 77), mock.last_request_timeout_secs);
+}
+
+test "resolveProviderForSession returns provider from returned holder storage" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.providers = &.{
+        .{
+            .name = "custom:dmr",
+            .base_url = "http://127.0.0.1:8080/v1",
+        },
+    };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const profile = config_types.NamedAgentConfig{
+        .name = "sub",
+        .provider = "custom:dmr",
+        .model = "smollm2",
+        .api_key = "placeholder",
+    };
+
+    var ctx = try sm.resolveProviderForSession(profile);
+    defer ctx.deinit(testing.allocator);
+
+    try testing.expect(ctx.provider == null);
+    try testing.expect(ctx.holder != null);
+    const holder_provider = ctx.holder.?.provider();
+    try testing.expect(@intFromPtr(holder_provider.ptr) != 0);
+    try testing.expect(@intFromPtr(holder_provider.vtable) != 0);
 }
 
 fn testBuildClaimToken(
