@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 
 /// Format bytes as human-readable string (e.g. "3.4 MB")
 pub fn formatBytes(bytes: u64) struct { value: f64, unit: []const u8 } {
@@ -13,7 +14,7 @@ pub fn formatBytes(bytes: u64) struct { value: f64, unit: []const u8 } {
 
 /// Get current timestamp as ISO 8601 string
 pub fn timestamp(buf: []u8) []const u8 {
-    const epoch = std.time.timestamp();
+    const epoch = std_compat.time.timestamp();
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(epoch) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();
@@ -170,6 +171,19 @@ pub fn truncateUtf8(s: []const u8, max_len: usize) []const u8 {
     return s[0..end];
 }
 
+pub const Utf8Preview = struct {
+    slice: []const u8,
+    truncated: bool,
+};
+
+pub fn previewUtf8(s: []const u8, max_len: usize) Utf8Preview {
+    const slice = truncateUtf8(s, max_len);
+    return .{
+        .slice = slice,
+        .truncated = slice.len < s.len,
+    };
+}
+
 test "truncateUtf8 does not split multi-byte sequences" {
     // ASCII-only: truncation at limit
     try std.testing.expectEqualStrings("abc", truncateUtf8("abcdef", 3));
@@ -195,4 +209,15 @@ test "truncateUtf8 does not split multi-byte sequences" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s2, 4)));
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s3, 3)));
     try std.testing.expect(std.unicode.utf8ValidateSlice(truncateUtf8(s4, 2)));
+}
+
+test "previewUtf8 reports truncation without splitting multi-byte sequences" {
+    const preview = previewUtf8("aaa\xd0\x99", 4);
+    try std.testing.expectEqualStrings("aaa", preview.slice);
+    try std.testing.expect(preview.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(preview.slice));
+
+    const full = previewUtf8("plain ascii", 64);
+    try std.testing.expectEqualStrings("plain ascii", full.slice);
+    try std.testing.expect(!full.truncated);
 }

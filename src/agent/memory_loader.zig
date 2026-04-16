@@ -84,7 +84,8 @@ pub fn loadContext(
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     var appended: usize = 0;
     var wrote_header = false;
@@ -99,7 +100,7 @@ pub fn loadContext(
         const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
         const sanitized = try sanitizeMemoryText(allocator, content);
         defer allocator.free(sanitized);
-        try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+        try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -118,7 +119,7 @@ pub fn loadContext(
                 const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
-                try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
@@ -130,6 +131,7 @@ pub fn loadContext(
     }
     try w.writeAll("\n");
 
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -148,7 +150,8 @@ pub fn loadContextWithRuntime(
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     var appended: usize = 0;
     var wrote_header = false;
 
@@ -164,7 +167,7 @@ pub fn loadContextWithRuntime(
         const snippet = util.truncateUtf8(cand.snippet, MAX_CONTEXT_BYTES / 2);
         const sanitized = try sanitizeMemoryText(allocator, snippet);
         defer allocator.free(sanitized);
-        try std.fmt.format(w, "- {s}: {s}\n", .{ cand.key, sanitized });
+        try w.print("- {s}: {s}\n", .{ cand.key, sanitized });
         appended += 1;
         if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
     }
@@ -186,7 +189,7 @@ pub fn loadContextWithRuntime(
                 const content = util.truncateUtf8(entry.content, MAX_CONTEXT_BYTES / 2);
                 const sanitized = try sanitizeMemoryText(allocator, content);
                 defer allocator.free(sanitized);
-                try std.fmt.format(w, "- {s}: {s}\n", .{ entry.key, sanitized });
+                try w.print("- {s}: {s}\n", .{ entry.key, sanitized });
                 appended += 1;
                 if (appended >= DEFAULT_RECALL_LIMIT or buf.items.len >= MAX_CONTEXT_BYTES) break;
             }
@@ -196,6 +199,7 @@ pub fn loadContextWithRuntime(
     if (!wrote_header) return try allocator.dupe(u8, "");
     try w.writeAll("\n");
 
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 
