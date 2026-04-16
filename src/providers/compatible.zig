@@ -132,8 +132,26 @@ fn isResponsesFallbackMessage(message: []const u8) bool {
         containsAsciiFold(trimmed, "/chat/completions");
 }
 
+fn isPlainTextResponsesFallbackMessage(body: []const u8) bool {
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    // Some compatible gateways return a plain-text 404 instead of a JSON error
+    // envelope when /chat/completions is missing.
+    return containsAsciiFold(trimmed, "/chat/completions") and
+        (containsAsciiFold(trimmed, "404") or
+            containsAsciiFold(trimmed, "not found") or
+            containsAsciiFold(trimmed, "unknown endpoint") or
+            containsAsciiFold(trimmed, "endpoint not found"));
+}
+
 fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
+    const trimmed = std.mem.trim(u8, body, " \t\r\n");
+    if (trimmed.len == 0) return false;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch {
+        return isPlainTextResponsesFallbackMessage(trimmed);
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return false;
 
@@ -146,15 +164,6 @@ fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) boo
 
     const message = lookupFallbackMessage(parsed.value.object) orelse return false;
     return isResponsesFallbackMessage(message);
-}
-
-fn shouldFallbackChatCompletionsError(
-    allocator: std.mem.Allocator,
-    err: anyerror,
-    body: []const u8,
-) bool {
-    if (err != error.SyntaxError) return false;
-    return shouldFallbackToResponses(allocator, body);
 }
 
 /// How the provider expects the API key to be sent.
@@ -1489,7 +1498,7 @@ pub const OpenAiCompatibleProvider = struct {
 
         return parseTextResponse(allocator, resp_body) catch |err| {
             // Only switch protocols when chat-completions explicitly reports endpoint absence.
-            if (self.supports_responses_fallback and shouldFallbackChatCompletionsError(allocator, err, resp_body)) {
+            if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
                 const fallback_messages = try buildSingleTurnMessages(allocator, eff_system, merged_msg orelse message, false);
                 defer freeSingleTurnMessages(allocator, fallback_messages);
                 const fallback_request = ChatRequest{
@@ -1580,7 +1589,7 @@ pub const OpenAiCompatibleProvider = struct {
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
-            if (self.supports_responses_fallback and shouldFallbackChatCompletionsError(allocator, err, resp_body)) {
+            if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
                 return self.chatViaResponses(
                     allocator,
                     capped_request,
@@ -2546,23 +2555,29 @@ test "shouldFallbackToResponses accepts msg fallback fields" {
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"No endpoints found that support image input\",\"code\":404}}"));
 }
 
-test "shouldFallbackChatCompletionsError only accepts syntax 404 endpoint errors" {
-    // Regression: #766 — the normal chatImpl path must fall back to Responses
-    // when chat/completions returns an endpoint-level 404 payload.
-    try std.testing.expect(shouldFallbackChatCompletionsError(
+test "structured chat endpoint 404 payloads surface as ApiError" {
+    // Regression: #766 follow-up — structured endpoint 404s are still generic
+    // API errors, so the fallback must key off the body instead of parser errors.
+    const body = "{\"error\":{\"message\":\"https://integrate.api.nvidia.com/v1/chat/completions 404 page not found\",\"code\":404}}";
+
+    try std.testing.expectError(error.ApiError, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+    try std.testing.expectError(error.ApiError, OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body));
+}
+
+test "shouldFallbackToResponses accepts plain text chat endpoint 404" {
+    // Regression: #766 — some gateways return the missing endpoint as plain
+    // text instead of a JSON error envelope.
+    try std.testing.expect(shouldFallbackToResponses(
         std.testing.allocator,
-        error.SyntaxError,
-        "{\"error\":{\"message\":\"https://integrate.api.nvidia.com/v1/chat/completions 404 page not found\",\"code\":404}}",
+        "https://integrate.api.nvidia.com/v1/chat/completions 404 page not found",
     ));
-    try std.testing.expect(!shouldFallbackChatCompletionsError(
+    try std.testing.expect(!shouldFallbackToResponses(
         std.testing.allocator,
-        error.NoResponseContent,
-        "{\"error\":{\"message\":\"https://integrate.api.nvidia.com/v1/chat/completions 404 page not found\",\"code\":404}}",
+        "https://integrate.api.nvidia.com/v1/responses 404 page not found",
     ));
-    try std.testing.expect(!shouldFallbackChatCompletionsError(
+    try std.testing.expect(!shouldFallbackToResponses(
         std.testing.allocator,
-        error.SyntaxError,
-        "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}",
+        "temporary overload",
     ));
 }
 
