@@ -173,17 +173,26 @@ fn hasConfiguredSearxngBaseUrl(base_url: ?[]const u8) bool {
 fn shouldIncludeSetupHint(self: *WebSearchTool, failures: []const FailureEntry) bool {
     if (hasConfiguredSearxngBaseUrl(self.searxng_base_url)) return false;
 
-    var saw_missing_api_key = false;
+    var saw_reliable_provider_gap = false;
     for (failures) |failure| {
         if (failure.err == error.MissingApiKey) {
-            saw_missing_api_key = true;
+            saw_reliable_provider_gap = true;
             continue;
         }
 
-        if (failure.provider == .duckduckgo and failure.err == error.RequestFailed) continue;
+        if (failure.provider == .duckduckgo) {
+            saw_reliable_provider_gap = true;
+            continue;
+        }
+
+        if (failure.provider == .searxng and failure.err == error.ProviderUnavailable) {
+            saw_reliable_provider_gap = true;
+            continue;
+        }
+
         return false;
     }
-    return saw_missing_api_key;
+    return saw_reliable_provider_gap;
 }
 
 fn buildSearchFailureSummary(allocator: std.mem.Allocator, failures: []const FailureEntry) ![]u8 {
@@ -192,7 +201,7 @@ fn buildSearchFailureSummary(allocator: std.mem.Allocator, failures: []const Fai
 
     for (failures, 0..) |failure, i| {
         if (i > 0) try buf.appendSlice(allocator, " | ");
-        try std.fmt.format(buf.writer(allocator), "{s}:{s}", .{ providerName(failure.provider), @errorName(failure.err) });
+        try buf.print(allocator, "{s}:{s}", .{ providerName(failure.provider), @errorName(failure.err) });
     }
 
     return buf.toOwnedSlice(allocator);
@@ -417,6 +426,39 @@ test "shouldIncludeSetupHint tolerates duckduckgo best-effort failure" {
     };
 
     try testing.expect(shouldIncludeSetupHint(&wst, &failures));
+}
+
+test "shouldIncludeSetupHint treats missing searxng base URL as setup gap" {
+    var wst = WebSearchTool{};
+    const failures = [_]FailureEntry{
+        .{ .provider = .searxng, .err = error.ProviderUnavailable },
+    };
+
+    try testing.expect(shouldIncludeSetupHint(&wst, &failures));
+}
+
+test "WebSearchTool explicit searxng without base URL returns setup guidance" {
+    // Regression: issue #812 should point explicit searxng users to search_base_url setup.
+    var wst = WebSearchTool{ .provider = "searxng" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "http_request.search_base_url") != null);
+}
+
+test "WebSearchTool explicit duckduckgo returns setup guidance when it fails" {
+    // Regression: issue #812 should explain that duckduckgo alone is best-effort only.
+    var wst = WebSearchTool{ .provider = "duckduckgo" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "DuckDuckGo is best-effort only") != null);
 }
 
 test "parseProvider accepts aliases" {
