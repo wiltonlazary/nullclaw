@@ -26,6 +26,9 @@ const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const NON_CLI_CHANNEL_CONFIGURED_MESSAGE = "at least one non-CLI channel configured";
+const NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE = "no non-CLI channels configured -- run `nullclaw onboard` to set one up";
+const CLI_ALWAYS_AVAILABLE_MESSAGE = "CLI always available";
 // ── ANSI color support ──────────────────────────────────────────
 
 extern "kernel32" fn GetStdHandle(nStdHandle: std.os.windows.DWORD) callconv(.winapi) ?std.os.windows.HANDLE;
@@ -279,9 +282,9 @@ pub fn checkConfigSemantics(
     const has_channel = channel_catalog.hasAnyConfigured(config, false);
 
     if (has_channel) {
-        try items.append(allocator, DiagItem.ok(cat, "at least one channel configured"));
+        try items.append(allocator, DiagItem.ok(cat, NON_CLI_CHANNEL_CONFIGURED_MESSAGE));
     } else {
-        try items.append(allocator, DiagItem.warn(cat, "no channels configured -- run `nullclaw onboard` to set one up"));
+        try items.append(allocator, DiagItem.warn(cat, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE));
     }
 }
 
@@ -701,7 +704,9 @@ fn checkCronStatus(allocator: std.mem.Allocator, items: *std.ArrayList(DiagItem)
 /// Check channel connectivity.
 fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.ArrayList(DiagItem)) void {
     const cat = "channels";
-    items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
+    if (channel_catalog.isBuildEnabled(.cli)) {
+        items.append(allocator, DiagItem.ok(cat, CLI_ALWAYS_AVAILABLE_MESSAGE)) catch {};
+    }
 
     for (channel_catalog.known_channels) |meta| {
         if (meta.id == .cli) continue;
@@ -825,7 +830,7 @@ test "checkConfigSemantics warns empty default provider" {
     try std.testing.expect(found_err);
 }
 
-test "checkConfigSemantics warns no channels" {
+test "checkConfigSemantics warns no non-CLI channels" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -836,11 +841,67 @@ test "checkConfigSemantics warns no channels" {
 
     var found_warn = false;
     for (items.items) |item| {
-        if (std.mem.indexOf(u8, item.message, "no channels") != null and item.severity == .warn) {
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
             found_warn = true;
         }
     }
     try std.testing.expect(found_warn);
+}
+
+test "checkConfigSemantics reports configured non-CLI channel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var items: std.ArrayList(DiagItem) = .empty;
+
+    var cfg = testConfig();
+    cfg.channels.webhook = .{};
+    try checkConfigSemantics(allocator, &cfg, &items);
+
+    var found_ok = false;
+    var found_warn = false;
+    for (items.items) |item| {
+        if (std.mem.eql(u8, item.message, NON_CLI_CHANNEL_CONFIGURED_MESSAGE) and item.severity == .ok) {
+            found_ok = true;
+        }
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
+            found_warn = true;
+        }
+    }
+    try std.testing.expect(found_ok);
+    try std.testing.expect(!found_warn);
+}
+
+test "doctor reports CLI availability separately from non-CLI channel configuration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = testConfig();
+
+    var config_items: std.ArrayList(DiagItem) = .empty;
+    try checkConfigSemantics(allocator, &cfg, &config_items);
+
+    // Regression: issue #827 showed a contradictory "no channels configured" warning
+    // even though the CLI channel was reported as available elsewhere in doctor output.
+    var found_non_cli_warn = false;
+    for (config_items.items) |item| {
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
+            found_non_cli_warn = true;
+        }
+    }
+    try std.testing.expect(found_non_cli_warn);
+
+    var channel_items: std.ArrayList(DiagItem) = .empty;
+    checkChannels(allocator, &cfg, &channel_items);
+
+    var found_cli_ok = false;
+    for (channel_items.items) |item| {
+        if (std.mem.eql(u8, item.message, CLI_ALWAYS_AVAILABLE_MESSAGE) and item.severity == .ok) {
+            found_cli_ok = true;
+        }
+    }
+    try std.testing.expectEqual(channel_catalog.isBuildEnabled(.cli), found_cli_ok);
 }
 
 test "parseDfAvailableMb parses output" {
