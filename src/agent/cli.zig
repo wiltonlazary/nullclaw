@@ -265,6 +265,14 @@ fn resolveProfileProvider(
     };
 }
 
+/// Resolve the provider only after any holder-backed override reaches stable storage.
+fn activeCliProvider(
+    provider_ctx: ?*CliProviderContext,
+    runtime_provider: ?*providers.runtime_bundle.RuntimeProviderBundle,
+) Provider {
+    return if (provider_ctx) |ctx| ctx.holder.provider() else runtime_provider.?.provider();
+}
+
 /// Run the agent in single-message or interactive REPL mode.
 /// This is the main entry point called by `nullclaw agent`.
 pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -472,7 +480,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
 
-    const provider_i: Provider = if (provider_ctx) |*ctx| ctx.holder.provider() else runtime_provider.?.provider();
+    const provider_i = activeCliProvider(
+        if (provider_ctx) |*ctx| ctx else null,
+        if (runtime_provider) |*bundle| bundle else null,
+    );
 
     const supports_streaming = provider_i.supportsStreaming();
 
@@ -932,7 +943,7 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
 }
 
-test "resolveProfileProvider returns provider from returned holder storage" {
+test "activeCliProvider uses returned holder storage for named agents" {
     var cfg = Config{
         .allocator = std.testing.allocator,
         .workspace_dir = "/tmp/nullclaw-cli-test",
@@ -951,12 +962,21 @@ test "resolveProfileProvider returns provider from returned holder storage" {
         .api_key = "placeholder",
     };
 
-    var ctx = try resolveProfileProvider(std.testing.allocator, &cfg, profile);
-    defer ctx.deinit(std.testing.allocator);
+    // Regression: issue #811 requires the runtime Provider to be derived from
+    // the returned holder storage, not from resolveProfileProvider's stack frame.
+    var provider_ctx = try resolveProfileProvider(std.testing.allocator, &cfg, profile);
+    defer provider_ctx.deinit(std.testing.allocator);
 
-    const provider = ctx.holder.provider();
-    try std.testing.expect(@intFromPtr(provider.ptr) != 0);
-    try std.testing.expect(@intFromPtr(provider.vtable) != 0);
+    const provider = activeCliProvider(&provider_ctx, null);
+    const holder_provider = provider_ctx.holder.provider();
+    try std.testing.expectEqual(@intFromPtr(holder_provider.ptr), @intFromPtr(provider.ptr));
+    try std.testing.expectEqual(@intFromPtr(holder_provider.vtable), @intFromPtr(provider.vtable));
+    switch (provider_ctx.holder) {
+        .compatible => |*compatible_provider| {
+            try std.testing.expectEqual(@intFromPtr(compatible_provider), @intFromPtr(provider.ptr));
+        },
+        else => unreachable,
+    }
 }
 
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {

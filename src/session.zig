@@ -2366,35 +2366,6 @@ test "probeVision uses vision route model ref and gateway timeout" {
     try testing.expectEqual(@as(u64, 77), mock.last_request_timeout_secs);
 }
 
-test "resolveProviderForSession returns provider from returned holder storage" {
-    var mock = MockProvider{ .response = "ok" };
-    var cfg = testConfig();
-    cfg.providers = &.{
-        .{
-            .name = "custom:dmr",
-            .base_url = "http://127.0.0.1:8080/v1",
-        },
-    };
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
-    defer sm.deinit();
-
-    const profile = config_types.NamedAgentConfig{
-        .name = "sub",
-        .provider = "custom:dmr",
-        .model = "smollm2",
-        .api_key = "placeholder",
-    };
-
-    var ctx = try sm.resolveProviderForSession(profile);
-    defer ctx.deinit(testing.allocator);
-
-    try testing.expect(ctx.provider == null);
-    try testing.expect(ctx.holder != null);
-    const holder_provider = ctx.holder.?.provider();
-    try testing.expect(@intFromPtr(holder_provider.ptr) != 0);
-    try testing.expect(@intFromPtr(holder_provider.vtable) != 0);
-}
-
 fn testBuildClaimToken(
     allocator: Allocator,
     secret: []const u8,
@@ -2772,17 +2743,26 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
     cfg.default_provider = "openrouter";
+    cfg.providers = &.{
+        .{
+            .name = "custom:dmr",
+            .base_url = "http://127.0.0.1:8080/v1",
+        },
+    };
     cfg.agents = &.{
         .{
             .name = "Coder Agent",
-            .provider = "ollama",
-            .model = "qwen2.5-coder:14b",
+            .provider = "custom:dmr",
+            .model = "smollm2",
+            .api_key = "placeholder",
         },
     };
 
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
+    // Regression: issue #811 requires holder-backed custom providers to bind
+    // Agent.provider to the session-owned holder rather than transient storage.
     const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
     try testing.expect(session.provider_holder != null);
 
@@ -2790,6 +2770,12 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     const holder_provider = holder.provider();
     try testing.expect(session.agent.provider.ptr == holder_provider.ptr);
     try testing.expect(session.agent.provider.vtable == holder_provider.vtable);
+    switch (session.provider_holder.?) {
+        .compatible => |*compatible_provider| {
+            try testing.expectEqual(@intFromPtr(compatible_provider), @intFromPtr(session.agent.provider.ptr));
+        },
+        else => unreachable,
+    }
 }
 
 test "getOrCreate uses named agent workspace namespace when workspace_path is set" {
