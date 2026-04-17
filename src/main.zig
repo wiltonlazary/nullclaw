@@ -2069,10 +2069,7 @@ const ModelProviderSummary = struct {
 };
 
 fn printStdoutBytes(text: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    bw.interface.writeAll(text) catch return;
-    bw.interface.flush() catch return;
+    std_compat.fs.File.stdout().writeAll(text) catch return;
 }
 
 fn appendJsonEscaped(buf: *std.array_list.Managed(u8), s: []const u8) !void {
@@ -3599,6 +3596,12 @@ test "buildModelsSummaryJson emits sorted provider summaries without key content
 
     const json = try buildModelsSummaryJson(allocator, &cfg);
     defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"default_provider\":\"openrouter\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"default_model\":\"openrouter/anthropic/claude-sonnet-4.6\"") != null);
