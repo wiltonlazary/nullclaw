@@ -171,7 +171,8 @@ fn logAgentProcessingError(
 
 fn defaultAgentErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.CurlTimeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
         error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -729,6 +730,71 @@ fn sendTelegramStartGreeting(
     };
 }
 
+fn telegramConversationContext(
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+) ?ConversationContext {
+    return buildConversationContext(.{
+        .channel = "telegram",
+        .account_id = account_id,
+        .delivery_chat_id = sender,
+        .peer_id = sender,
+        .is_group = is_group,
+        .group_id = if (is_group) sender else null,
+    });
+}
+
+fn handleTelegramInteractiveCallback(
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+    session_key: []const u8,
+    content: []const u8,
+    sender: []const u8,
+    message_id: i64,
+    is_group: bool,
+    message_sender_id: []const u8,
+) bool {
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+
+    var response_owned = false;
+    const response = blk: {
+        if (control_plane.parseSlashCommand(content) != null) {
+            const maybe_local = runtime.session_mgr.handleLocalSlashCommand(session_key, content, conversation_context) catch |err| {
+                log.err("failed to handle telegram callback slash command locally: {}", .{err});
+                response_owned = true;
+                break :blk allocator.dupe(u8, "Failed to update interactive menu.") catch return true;
+            };
+            if (maybe_local) |reply| {
+                response_owned = true;
+                break :blk reply;
+            }
+            return false;
+        }
+
+        const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+            log.err("failed to process telegram callback interaction: {}", .{err});
+            response_owned = true;
+            break :blk allocator.dupe(u8, defaultAgentErrorMessage(err)) catch return true;
+        };
+        response_owned = true;
+        break :blk model_reply;
+    };
+    defer if (response_owned) allocator.free(response);
+
+    if (shouldSuppressGroupReply(is_group, response)) return true;
+
+    tg_ptr.editAssistantMessage(sender, message_sender_id, is_group, message_id, response) catch |err| {
+        log.warn("failed to edit telegram callback response in place: {}", .{err});
+        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, response, message_id) catch |send_err| {
+            log.err("failed to send telegram callback fallback reply: {}", .{send_err});
+        };
+        return true;
+    };
+    return true;
+}
+
 fn handleTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
     session_mgr: *session_mod.SessionManager,
@@ -901,14 +967,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = buildConversationContext(.{
-        .channel = "telegram",
-        .account_id = tg_ptr.account_id,
-        .delivery_chat_id = sender,
-        .peer_id = sender,
-        .is_group = is_group,
-        .group_id = if (is_group) sender else null,
-    });
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -1456,6 +1515,38 @@ pub fn runTelegramLoop(
             // Reply-to logic
             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
+
+            if (msg.is_interaction_callback and msg.message_id != null) {
+                const session_key = resolveTelegramSessionKey(
+                    allocator,
+                    &runtime.session_mgr,
+                    config,
+                    tg_ptr.account_id,
+                    msg.sender,
+                    msg.is_group,
+                ) catch |err| {
+                    log.err("failed to resolve telegram session key for interactive skill menu: {}", .{err});
+                    tg_ptr.sendMessageWithReply(msg.sender, "Failed to resolve session for this skill menu.", reply_to_id) catch |send_err| {
+                        log.err("failed to send telegram skill-menu session error reply: {}", .{send_err});
+                    };
+                    continue;
+                };
+                defer allocator.free(session_key);
+
+                if (handleTelegramInteractiveCallback(
+                    allocator,
+                    runtime,
+                    tg_ptr,
+                    session_key,
+                    msg.content,
+                    msg.sender,
+                    msg.message_id.?,
+                    msg.is_group,
+                    msg.id,
+                )) {
+                    continue;
+                }
+            }
 
             if (handleTelegramBuiltinCommand(
                 allocator,
@@ -2715,6 +2806,30 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
+}
+
+test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
+    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+
+    // Regression: Telegram button callbacks must keep the outbound delivery target,
+    // or scheduled/tool-driven follow-ups can route to the session peer only.
+    try std.testing.expectEqualStrings("telegram", context.channel.?);
+    try std.testing.expectEqualStrings("main", context.account_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
+test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {
+    try std.testing.expectEqualStrings(
+        "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        defaultAgentErrorMessage(error.CurlTimeout),
+    );
+    try std.testing.expectEqualStrings(
+        "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        defaultAgentErrorMessage(error.CurlConnectError),
+    );
 }
 
 test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {
