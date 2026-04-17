@@ -1253,6 +1253,7 @@ pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_a
 pub const wizard_memory_backend_order = [_][]const u8{
     "hybrid",
     "sqlite",
+    "kg",
     "markdown",
     "memory",
     "none",
@@ -1280,6 +1281,7 @@ fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const mem
 pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
     if (std.mem.eql(u8, backend, "hybrid")) return "hybrid_keyword";
     if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
+    if (std.mem.eql(u8, backend, "kg")) return "local_keyword";
     if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
     if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
     if (std.mem.eql(u8, backend, "none")) return "minimal_none";
@@ -3328,6 +3330,7 @@ test "selectableBackendsForWizard prioritizes hybrid and keeps api last" {
 test "memoryProfileForBackend maps common backends" {
     try std.testing.expectEqualStrings("hybrid_keyword", memoryProfileForBackend("hybrid"));
     try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("sqlite"));
+    try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("kg"));
     try std.testing.expectEqualStrings("markdown_only", memoryProfileForBackend("markdown"));
     try std.testing.expectEqualStrings("postgres_keyword", memoryProfileForBackend("postgres"));
     try std.testing.expectEqualStrings("minimal_none", memoryProfileForBackend("none"));

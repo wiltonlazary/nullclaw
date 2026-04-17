@@ -18,6 +18,10 @@
 //!   "kg:path:{from}:{to}:{max_depth}"     — find path between two entities
 //!   "kg:relations:{entity_id}"             — all edges for an entity
 //!   plain text                             — FTS5 search on entity content
+//!
+//! Query arguments and relation-key segments use percent-encoding for reserved
+//! bytes; prefer `KgMemory.traverseQuery`, `pathQuery`, `relationsQuery`, and
+//! `relationStoreKey` when composing these strings programmatically.
 
 const std = @import("std");
 const std_compat = @import("compat");
@@ -32,14 +36,20 @@ const RELATION_STORE_PREFIX = "__kg:rel:";
 const TRAVERSE_QUERY_PREFIX = "kg:traverse:";
 const PATH_QUERY_PREFIX = "kg:path:";
 const RELATIONS_QUERY_PREFIX = "kg:relations:";
-const RELATION_CATEGORY = "relation";
+const RELATION_CATEGORY = "__kg:relation";
 const DEFAULT_QUERY_LIMIT: usize = 100;
 
 const ParsedRelationKey = struct {
     id: []const u8,
-    subject_id: []const u8,
-    predicate: []const u8,
-    object_id: []const u8,
+    subject_id: []u8,
+    predicate: []u8,
+    object_id: []u8,
+
+    fn deinit(self: ParsedRelationKey, allocator: std.mem.Allocator) void {
+        allocator.free(self.subject_id);
+        allocator.free(self.predicate);
+        allocator.free(self.object_id);
+    }
 };
 
 pub const c = @cImport({
@@ -143,6 +153,137 @@ pub const KgMemory = struct {
         return if (limit > 0) limit else DEFAULT_QUERY_LIMIT;
     }
 
+    fn execSql(self: *Self, sql: [:0]const u8) !void {
+        var err_msg: [*c]u8 = null;
+        defer if (err_msg) |msg| c.sqlite3_free(msg);
+
+        const rc = c.sqlite3_exec(self.db, sql, null, null, &err_msg);
+        if (rc != c.SQLITE_OK) {
+            log.warn("kg exec failed for '{s}': {s}", .{
+                sql,
+                if (err_msg) |msg| std.mem.span(msg) else "unknown",
+            });
+            return error.SqlExecFailed;
+        }
+    }
+
+    fn beginTransaction(self: *Self) !void {
+        try self.execSql("BEGIN IMMEDIATE;");
+    }
+
+    fn commitTransaction(self: *Self) !void {
+        try self.execSql("COMMIT;");
+    }
+
+    fn rollbackTransaction(self: *Self) !void {
+        try self.execSql("ROLLBACK;");
+    }
+
+    fn rollbackTransactionQuiet(self: *Self) void {
+        self.rollbackTransaction() catch |err| {
+            log.warn("kg rollback failed: {}", .{err});
+        };
+    }
+
+    fn isUnreservedByte(byte: u8) bool {
+        return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or byte == '_' or byte == '~';
+    }
+
+    fn appendPercentEncodedByte(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, byte: u8) !void {
+        const hex = "0123456789ABCDEF";
+        try out.append(allocator, '%');
+        try out.append(allocator, hex[byte >> 4]);
+        try out.append(allocator, hex[byte & 0x0F]);
+    }
+
+    fn percentEncode(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        for (raw) |byte| {
+            if (isUnreservedByte(byte)) {
+                try out.append(allocator, byte);
+            } else {
+                try appendPercentEncodedByte(&out, allocator, byte);
+            }
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn decodeHexNibble(byte: u8) !u8 {
+        return switch (byte) {
+            '0'...'9' => byte - '0',
+            'a'...'f' => 10 + (byte - 'a'),
+            'A'...'F' => 10 + (byte - 'A'),
+            else => error.InvalidPercentEncoding,
+        };
+    }
+
+    fn percentDecode(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        var i: usize = 0;
+        while (i < encoded.len) {
+            if (encoded[i] != '%') {
+                try out.append(allocator, encoded[i]);
+                i += 1;
+                continue;
+            }
+
+            if (i + 2 >= encoded.len) return error.InvalidPercentEncoding;
+            const hi = try decodeHexNibble(encoded[i + 1]);
+            const lo = try decodeHexNibble(encoded[i + 2]);
+            try out.append(allocator, (hi << 4) | lo);
+            i += 3;
+        }
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    pub fn relationStoreKey(allocator: std.mem.Allocator, subject_id: []const u8, predicate: []const u8, object_id: []const u8) ![]u8 {
+        const subject_id_enc = try percentEncode(allocator, subject_id);
+        defer allocator.free(subject_id_enc);
+        const predicate_enc = try percentEncode(allocator, predicate);
+        defer allocator.free(predicate_enc);
+        const object_id_enc = try percentEncode(allocator, object_id);
+        defer allocator.free(object_id_enc);
+
+        return std.fmt.allocPrint(allocator, RELATION_STORE_PREFIX ++ "{s}:{s}:{s}", .{
+            subject_id_enc,
+            predicate_enc,
+            object_id_enc,
+        });
+    }
+
+    pub fn traverseQuery(allocator: std.mem.Allocator, entity_id: []const u8, max_depth: usize) ![]u8 {
+        const entity_id_enc = try percentEncode(allocator, entity_id);
+        defer allocator.free(entity_id_enc);
+
+        return std.fmt.allocPrint(allocator, TRAVERSE_QUERY_PREFIX ++ "{s}:{d}", .{ entity_id_enc, max_depth });
+    }
+
+    pub fn pathQuery(allocator: std.mem.Allocator, from_id: []const u8, to_id: []const u8, max_depth: usize) ![]u8 {
+        const from_id_enc = try percentEncode(allocator, from_id);
+        defer allocator.free(from_id_enc);
+        const to_id_enc = try percentEncode(allocator, to_id);
+        defer allocator.free(to_id_enc);
+
+        return std.fmt.allocPrint(allocator, PATH_QUERY_PREFIX ++ "{s}:{s}:{d}", .{
+            from_id_enc,
+            to_id_enc,
+            max_depth,
+        });
+    }
+
+    pub fn relationsQuery(allocator: std.mem.Allocator, entity_id: []const u8) ![]u8 {
+        const entity_id_enc = try percentEncode(allocator, entity_id);
+        defer allocator.free(entity_id_enc);
+
+        return std.fmt.allocPrint(allocator, RELATIONS_QUERY_PREFIX ++ "{s}", .{entity_id_enc});
+    }
+
     fn entityIdForKey(key: []const u8) []const u8 {
         if (std.mem.startsWith(u8, key, ENTITY_STORE_PREFIX)) return key[ENTITY_STORE_PREFIX.len..];
         return key;
@@ -153,14 +294,22 @@ pub const KgMemory = struct {
         return key;
     }
 
-    fn parseRelationKey(key: []const u8) !ParsedRelationKey {
+    fn parseRelationKey(allocator: std.mem.Allocator, key: []const u8) !ParsedRelationKey {
         if (!std.mem.startsWith(u8, key, RELATION_STORE_PREFIX)) return error.InvalidRelationKey;
 
         const id = relationIdForKey(key);
         var it = std.mem.splitScalar(u8, id, ':');
-        const subject_id = it.next() orelse return error.InvalidRelationKey;
-        const predicate = it.next() orelse return error.InvalidRelationKey;
-        const object_id = it.rest();
+        const subject_id_enc = it.next() orelse return error.InvalidRelationKey;
+        const predicate_enc = it.next() orelse return error.InvalidRelationKey;
+        const object_id_enc = it.next() orelse return error.InvalidRelationKey;
+        if (it.next() != null) return error.InvalidRelationKey;
+
+        const subject_id = try percentDecode(allocator, subject_id_enc);
+        errdefer allocator.free(subject_id);
+        const predicate = try percentDecode(allocator, predicate_enc);
+        errdefer allocator.free(predicate);
+        const object_id = try percentDecode(allocator, object_id_enc);
+        errdefer allocator.free(object_id);
 
         if (subject_id.len == 0 or predicate.len == 0 or object_id.len == 0) {
             return error.InvalidRelationKey;
@@ -183,10 +332,6 @@ pub const KgMemory = struct {
             },
             .custom => return .{ .custom = raw },
         }
-    }
-
-    fn isRelationCategory(category: MemoryCategory) bool {
-        return std.mem.eql(u8, category.toString(), RELATION_CATEGORY);
     }
 
     fn buildFtsQuery(allocator: std.mem.Allocator, query: []const u8) ![]u8 {
@@ -247,6 +392,10 @@ pub const KgMemory = struct {
         const now = try getNowTimestamp(self.allocator);
         defer self.allocator.free(now);
 
+        try self.beginTransaction();
+        var committed = false;
+        errdefer if (!committed) self.rollbackTransactionQuiet();
+
         const sql = "INSERT INTO kg_entities (id, type, content, created_at) VALUES (?1, ?2, ?3, ?4) " ++
             "ON CONFLICT(id) DO UPDATE SET content = excluded.content, type = excluded.type";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -263,6 +412,8 @@ pub const KgMemory = struct {
         if (rc != c.SQLITE_DONE) return error.StepFailed;
 
         try self.refreshEntityFts(id, content);
+        try self.commitTransaction();
+        committed = true;
     }
 
     fn storeRelation(self: *Self, id: []const u8, subject_id: []const u8, predicate: []const u8, object_id: []const u8) !void {
@@ -299,13 +450,13 @@ pub const KgMemory = struct {
 
         const sql =
             \\WITH RECURSIVE traversal(path_ids, id, depth) AS (
-            \\  SELECT '<' || ?1, ?1, 0
+            \\  SELECT '|' || hex(CAST(?1 AS BLOB)) || '|', ?1, 0
             \\  UNION ALL
-            \\  SELECT t.path_ids || '<' || r.object_id, r.object_id, t.depth + 1
+            \\  SELECT t.path_ids || hex(CAST(r.object_id AS BLOB)) || '|', r.object_id, t.depth + 1
             \\   FROM kg_relations r
             \\   JOIN traversal t ON r.subject_id = t.id
             \\   WHERE t.depth < ?2
-            \\     AND INSTR(t.path_ids || '<', '<' || r.object_id || '<') = 0
+            \\     AND INSTR(t.path_ids, '|' || hex(CAST(r.object_id AS BLOB)) || '|') = 0
             \\)
             \\, ranked(id, depth) AS (
             \\  SELECT id, MIN(depth)
@@ -347,13 +498,13 @@ pub const KgMemory = struct {
 
         const sql =
             \\WITH RECURSIVE path(path_ids, id, depth) AS (
-            \\  SELECT '<' || ?1, ?1, 0
+            \\  SELECT '|' || hex(CAST(?1 AS BLOB)) || '|', ?1, 0
             \\  UNION ALL
-            \\  SELECT p.path_ids || '<' || r.object_id, r.object_id, p.depth + 1
+            \\  SELECT p.path_ids || hex(CAST(r.object_id AS BLOB)) || '|', r.object_id, p.depth + 1
             \\   FROM kg_relations r
             \\   JOIN path p ON r.subject_id = p.id
             \\   WHERE r.subject_id = p.id AND p.depth < ?3
-            \\     AND INSTR(p.path_ids || '<', '<' || r.object_id || '<') = 0
+            \\     AND INSTR(p.path_ids, '|' || hex(CAST(r.object_id AS BLOB)) || '|') = 0
             \\)
             \\, target(path_ids) AS (
             \\  SELECT path_ids
@@ -362,20 +513,20 @@ pub const KgMemory = struct {
             \\  ORDER BY depth ASC
             \\  LIMIT 1
             \\)
-            \\, split(rest, node_id, ord) AS (
-            \\  SELECT substr(path_ids, 2) || '<', '', 0
+            \\, split(rest, node_hex, ord) AS (
+            \\  SELECT substr(path_ids, 2), '', 0
             \\  FROM target
             \\  UNION ALL
-            \\  SELECT substr(rest, instr(rest, '<') + 1),
-            \\         substr(rest, 1, instr(rest, '<') - 1),
+            \\  SELECT substr(rest, instr(rest, '|') + 1),
+            \\         substr(rest, 1, instr(rest, '|') - 1),
             \\         ord + 1
             \\  FROM split
             \\  WHERE rest <> ''
             \\)
             \\SELECT e.id, e.type, e.content, e.created_at
             \\FROM split s
-            \\JOIN kg_entities e ON e.id = s.node_id
-            \\WHERE s.node_id <> ''
+            \\JOIN kg_entities e ON hex(CAST(e.id AS BLOB)) = s.node_hex
+            \\WHERE s.node_hex <> ''
             \\ORDER BY s.ord ASC
             \\LIMIT ?4
         ;
@@ -460,6 +611,32 @@ pub const KgMemory = struct {
 
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             try entries.append(allocator, try self.readRelationFromRow(stmt.?, allocator));
+        }
+    }
+
+    fn appendAllList(self: *Self, entries: *std.ArrayListUnmanaged(MemoryEntry), allocator: std.mem.Allocator) !void {
+        const sql =
+            \\SELECT kind, id, type, content, subject_id, predicate, object_id, created_at
+            \\FROM (
+            \\  SELECT 0 AS kind, id, type, content, NULL AS subject_id, NULL AS predicate, NULL AS object_id, created_at
+            \\  FROM kg_entities
+            \\  UNION ALL
+            \\  SELECT 1 AS kind, id, NULL AS type, NULL AS content, subject_id, predicate, object_id, created_at
+            \\  FROM kg_relations
+            \\)
+            \\ORDER BY created_at DESC, id DESC
+        ;
+
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (c.sqlite3_column_int(stmt, 0) == 0) {
+                try entries.append(allocator, try self.readEntityFromMixedRow(stmt.?, allocator));
+            } else {
+                try entries.append(allocator, try self.readRelationFromMixedRow(stmt.?, allocator));
+            }
         }
     }
 
@@ -610,6 +787,79 @@ pub const KgMemory = struct {
         };
     }
 
+    fn readEntityFromMixedRow(_: *Self, stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEntry {
+        const id_ptr = c.sqlite3_column_text(stmt, 1);
+        const type_ptr = c.sqlite3_column_text(stmt, 2);
+        const content_ptr = c.sqlite3_column_text(stmt, 3);
+        const created_ptr = c.sqlite3_column_text(stmt, 7);
+
+        if (id_ptr == null or type_ptr == null or content_ptr == null or created_ptr == null) {
+            return error.StepFailed;
+        }
+
+        const id = try allocator.dupe(u8, std.mem.span(id_ptr));
+        errdefer allocator.free(id);
+        const type_str = try allocator.dupe(u8, std.mem.span(type_ptr));
+        errdefer allocator.free(type_str);
+        const content = try allocator.dupe(u8, std.mem.span(content_ptr));
+        errdefer allocator.free(content);
+        const created_at = try allocator.dupe(u8, std.mem.span(created_ptr));
+        errdefer allocator.free(created_at);
+        const key = try allocator.dupe(u8, id);
+        errdefer allocator.free(key);
+
+        return MemoryEntry{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = categoryFromOwnedString(allocator, type_str),
+            .timestamp = created_at,
+        };
+    }
+
+    fn readRelationFromMixedRow(_: *Self, stmt: *c.sqlite3_stmt, allocator: std.mem.Allocator) !MemoryEntry {
+        const id_ptr = c.sqlite3_column_text(stmt, 1);
+        const subject_ptr = c.sqlite3_column_text(stmt, 4);
+        const predicate_ptr = c.sqlite3_column_text(stmt, 5);
+        const object_ptr = c.sqlite3_column_text(stmt, 6);
+        const created_ptr = c.sqlite3_column_text(stmt, 7);
+
+        if (id_ptr == null or subject_ptr == null or predicate_ptr == null or object_ptr == null or created_ptr == null) {
+            return error.StepFailed;
+        }
+
+        const id = try allocator.dupe(u8, std.mem.span(id_ptr));
+        errdefer allocator.free(id);
+
+        const subject_id = try allocator.dupe(u8, std.mem.span(subject_ptr));
+        defer allocator.free(subject_id);
+        const predicate = try allocator.dupe(u8, std.mem.span(predicate_ptr));
+        defer allocator.free(predicate);
+        const object_id = try allocator.dupe(u8, std.mem.span(object_ptr));
+        defer allocator.free(object_id);
+
+        const created_at = try allocator.dupe(u8, std.mem.span(created_ptr));
+        errdefer allocator.free(created_at);
+        const key = try std.fmt.allocPrint(allocator, RELATION_STORE_PREFIX ++ "{s}", .{id});
+        errdefer allocator.free(key);
+        const content = try std.fmt.allocPrint(allocator, "{s} --{s}--> {s}", .{
+            subject_id,
+            predicate,
+            object_id,
+        });
+        errdefer allocator.free(content);
+        const category_name = try allocator.dupe(u8, RELATION_CATEGORY);
+        errdefer allocator.free(category_name);
+
+        return MemoryEntry{
+            .id = id,
+            .key = key,
+            .content = content,
+            .category = .{ .custom = category_name },
+            .timestamp = created_at,
+        };
+    }
+
     // ── VTable implementations ────────────────────────────────────────
 
     fn implName(_: *anyopaque) []const u8 {
@@ -624,7 +874,8 @@ pub const KgMemory = struct {
             const entity_id = entityIdForKey(key);
             try self_.storeEntity(entity_id, cat_str, content);
         } else if (std.mem.startsWith(u8, key, RELATION_STORE_PREFIX)) {
-            const parsed = try parseRelationKey(key);
+            const parsed = try parseRelationKey(self_.allocator, key);
+            defer parsed.deinit(self_.allocator);
             try self_.storeRelation(parsed.id, parsed.subject_id, parsed.predicate, parsed.object_id);
         } else {
             // Generic key — treat as entity
@@ -641,8 +892,11 @@ pub const KgMemory = struct {
         if (std.mem.startsWith(u8, trimmed, TRAVERSE_QUERY_PREFIX)) {
             const args = trimmed[TRAVERSE_QUERY_PREFIX.len..];
             var it = std.mem.splitScalar(u8, args, ':');
-            const entity_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
+            const entity_id_enc = it.next() orelse return allocator.alloc(MemoryEntry, 0);
             const depth_str = it.next() orelse "3";
+            if (it.next() != null) return error.InvalidKgQuery;
+            const entity_id = try percentDecode(allocator, entity_id_enc);
+            defer allocator.free(entity_id);
             const max_depth = std.fmt.parseInt(usize, depth_str, 10) catch 3;
             return self_.traverse(allocator, entity_id, max_depth, limit);
         }
@@ -650,16 +904,23 @@ pub const KgMemory = struct {
         if (std.mem.startsWith(u8, trimmed, PATH_QUERY_PREFIX)) {
             const args = trimmed[PATH_QUERY_PREFIX.len..];
             var it = std.mem.splitScalar(u8, args, ':');
-            const from_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
-            const to_id = it.next() orelse return allocator.alloc(MemoryEntry, 0);
+            const from_id_enc = it.next() orelse return allocator.alloc(MemoryEntry, 0);
+            const to_id_enc = it.next() orelse return allocator.alloc(MemoryEntry, 0);
             const depth_str = it.next() orelse "5";
+            if (it.next() != null) return error.InvalidKgQuery;
+            const from_id = try percentDecode(allocator, from_id_enc);
+            defer allocator.free(from_id);
+            const to_id = try percentDecode(allocator, to_id_enc);
+            defer allocator.free(to_id);
             const max_depth = std.fmt.parseInt(usize, depth_str, 10) catch 5;
             return self_.findPath(allocator, from_id, to_id, max_depth, limit);
         }
 
         if (std.mem.startsWith(u8, trimmed, RELATIONS_QUERY_PREFIX)) {
-            const entity_id = trimmed[RELATIONS_QUERY_PREFIX.len..];
-            if (entity_id.len == 0) return allocator.alloc(MemoryEntry, 0);
+            const entity_id_enc = trimmed[RELATIONS_QUERY_PREFIX.len..];
+            if (entity_id_enc.len == 0) return allocator.alloc(MemoryEntry, 0);
+            const entity_id = try percentDecode(allocator, entity_id_enc);
+            defer allocator.free(entity_id);
             return self_.getRelations(allocator, entity_id, limit);
         }
 
@@ -696,14 +957,9 @@ pub const KgMemory = struct {
         }
 
         if (category) |cat| {
-            if (isRelationCategory(cat)) {
-                try self_.appendRelationList(&entries, allocator);
-            } else {
-                try self_.appendEntityList(&entries, allocator, cat);
-            }
+            try self_.appendEntityList(&entries, allocator, cat);
         } else {
-            try self_.appendEntityList(&entries, allocator, null);
-            try self_.appendRelationList(&entries, allocator);
+            try self_.appendAllList(&entries, allocator);
         }
 
         return entries.toOwnedSlice(allocator);
@@ -715,6 +971,10 @@ pub const KgMemory = struct {
 
         // Try to delete as entity first
         {
+            try self_.beginTransaction();
+            var committed = false;
+            errdefer if (!committed) self_.rollbackTransactionQuiet();
+
             const sql = "DELETE FROM kg_entities WHERE id = ?1";
             var stmt: ?*c.sqlite3_stmt = null;
             var rc = c.sqlite3_prepare_v2(self_.db, sql, -1, &stmt, null);
@@ -726,8 +986,12 @@ pub const KgMemory = struct {
             if (c.sqlite3_changes(self_.db) > 0) {
                 try self_.deleteEntityFts(entity_id);
                 try self_.deleteRelationsForEntity(entity_id);
+                try self_.commitTransaction();
+                committed = true;
                 return true;
             }
+            try self_.commitTransaction();
+            committed = true;
         }
 
         // Try as relation id
@@ -1004,11 +1268,60 @@ test "kg list can return relation entries" {
     const all_entries = try m.list(std.testing.allocator, null, null);
     defer root.freeEntries(std.testing.allocator, all_entries);
     try std.testing.expectEqual(@as(usize, 3), all_entries.len);
+    var saw_relation = false;
+    for (all_entries) |entry| {
+        if (std.mem.eql(u8, entry.key, "__kg:rel:a:knows:b")) saw_relation = true;
+    }
+    try std.testing.expect(saw_relation);
+}
 
-    const relation_entries = try m.list(std.testing.allocator, .{ .custom = RELATION_CATEGORY }, null);
-    defer root.freeEntries(std.testing.allocator, relation_entries);
-    try std.testing.expectEqual(@as(usize, 1), relation_entries.len);
-    try std.testing.expectEqualStrings("__kg:rel:a:knows:b", relation_entries[0].key);
+test "kg list keeps global recency order across entities and relations" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: list(null) must not append all relations after all entities.
+    try m.store("__kg:entity:a", "Alice", .core, null);
+    try m.store("__kg:entity:b", "Bob", .core, null);
+    try m.store("__kg:rel:a:links:b", "", .core, null);
+
+    try kg.execSql(
+        \\UPDATE kg_entities
+        \\SET created_at = CASE id
+        \\  WHEN 'a' THEN '1'
+        \\  WHEN 'b' THEN '2'
+        \\  ELSE created_at
+        \\END;
+        \\UPDATE kg_relations
+        \\SET created_at = '3'
+        \\WHERE id = 'a:links:b';
+    );
+
+    const all_entries = try m.list(std.testing.allocator, null, null);
+    defer root.freeEntries(std.testing.allocator, all_entries);
+
+    try std.testing.expectEqual(@as(usize, 3), all_entries.len);
+    try std.testing.expectEqualStrings("__kg:rel:a:links:b", all_entries[0].key);
+    try std.testing.expectEqualStrings("b", all_entries[1].key);
+    try std.testing.expectEqualStrings("a", all_entries[2].key);
+}
+
+test "kg list preserves user custom relation category" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: a user custom category named "relation" must not be hijacked by edge listing.
+    try m.store("__kg:entity:user_relation", "User-defined relation category", .{ .custom = "relation" }, null);
+    try m.store("__kg:entity:b", "Bob", .core, null);
+    try m.store("__kg:rel:user_relation:links:b", "", .core, null);
+
+    const filtered = try m.list(std.testing.allocator, .{ .custom = "relation" }, null);
+    defer root.freeEntries(std.testing.allocator, filtered);
+
+    try std.testing.expectEqual(@as(usize, 1), filtered.len);
+    try std.testing.expectEqualStrings("user_relation", filtered[0].key);
+    try std.testing.expect(filtered[0].category.eql(.{ .custom = "relation" }));
 }
 
 test "kg forgetting entity removes incident relations" {
@@ -1035,4 +1348,81 @@ test "kg rejects malformed relation keys" {
 
     // Regression: malformed relation keys must fail fast instead of creating partial rows.
     try std.testing.expectError(error.InvalidRelationKey, m.store("__kg:rel:a:knows:", "", .core, null));
+}
+
+test "kg relation helpers support reserved characters" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: graph ids containing ':' or '<' must round-trip through key/query encoding.
+    try m.store("__kg:entity:alpha:1", "Alpha", .core, null);
+    try m.store("__kg:entity:beta<2", "Beta", .core, null);
+
+    const relation_key = try KgMemory.relationStoreKey(std.testing.allocator, "alpha:1", "links:<to>", "beta<2");
+    defer std.testing.allocator.free(relation_key);
+    try m.store(relation_key, "", .core, null);
+
+    const relation_entry = try m.get(std.testing.allocator, relation_key);
+    try std.testing.expect(relation_entry != null);
+    defer relation_entry.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(relation_key, relation_entry.?.key);
+    try std.testing.expectEqualStrings("alpha:1 --links:<to>--> beta<2", relation_entry.?.content);
+
+    const relations_query = try KgMemory.relationsQuery(std.testing.allocator, "alpha:1");
+    defer std.testing.allocator.free(relations_query);
+    const relation_results = try m.recall(std.testing.allocator, relations_query, 10, null);
+    defer root.freeEntries(std.testing.allocator, relation_results);
+    try std.testing.expectEqual(@as(usize, 1), relation_results.len);
+    try std.testing.expectEqualStrings(relation_key, relation_results[0].key);
+
+    const path_query = try KgMemory.pathQuery(std.testing.allocator, "alpha:1", "beta<2", 3);
+    defer std.testing.allocator.free(path_query);
+    const path_results = try m.recall(std.testing.allocator, path_query, 10, null);
+    defer root.freeEntries(std.testing.allocator, path_results);
+    try std.testing.expectEqual(@as(usize, 2), path_results.len);
+    try std.testing.expectEqualStrings("alpha:1", path_results[0].key);
+    try std.testing.expectEqualStrings("beta<2", path_results[1].key);
+
+    const traverse_query = try KgMemory.traverseQuery(std.testing.allocator, "alpha:1", 3);
+    defer std.testing.allocator.free(traverse_query);
+    const traverse_results = try m.recall(std.testing.allocator, traverse_query, 10, null);
+    defer root.freeEntries(std.testing.allocator, traverse_results);
+    try std.testing.expectEqual(@as(usize, 2), traverse_results.len);
+    try std.testing.expectEqualStrings("alpha:1", traverse_results[0].key);
+    try std.testing.expectEqualStrings("beta<2", traverse_results[1].key);
+}
+
+test "kg store rolls back entity when fts maintenance fails" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: entity writes must not partially commit when FTS refresh fails.
+    try kg.execSql("DROP TABLE kg_entities_fts;");
+    try std.testing.expectError(error.PrepareFailed, m.store("__kg:entity:e1", "should rollback", .core, null));
+    try std.testing.expectEqual(@as(usize, 0), try m.count());
+    try std.testing.expect((try m.get(std.testing.allocator, "e1")) == null);
+}
+
+test "kg forget rolls back entity delete when cleanup fails" {
+    var kg = try KgMemory.init(std.testing.allocator, ":memory:");
+    defer kg.deinit();
+    const m = kg.memory();
+
+    // Regression: entity deletes must roll back when FTS cleanup fails.
+    try m.store("__kg:entity:a", "Alice", .core, null);
+    try m.store("__kg:entity:b", "Bob", .core, null);
+    try m.store("__kg:rel:a:knows:b", "", .core, null);
+
+    try kg.execSql("DROP TABLE kg_entities_fts;");
+    try std.testing.expectError(error.PrepareFailed, m.forget("__kg:entity:a"));
+
+    try std.testing.expectEqual(@as(usize, 3), try m.count());
+    const entity = try m.get(std.testing.allocator, "a");
+    try std.testing.expect(entity != null);
+    defer entity.?.deinit(std.testing.allocator);
+    const relation = try m.get(std.testing.allocator, "__kg:rel:a:knows:b");
+    try std.testing.expect(relation != null);
+    defer relation.?.deinit(std.testing.allocator);
 }
