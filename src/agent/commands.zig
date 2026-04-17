@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
 const Tool = @import("../tools/root.zig").Tool;
@@ -20,6 +21,7 @@ const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const util = @import("../util.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -774,9 +776,9 @@ fn primaryModelProviderObjectJson(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var model_obj = std.json.ObjectMap.init(arena.allocator());
-    try model_obj.put("provider", .{ .string = provider });
-    try model_obj.put("primary", .{ .string = model });
+    var model_obj: std.json.ObjectMap = .empty;
+    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
+    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
 }
 
@@ -2002,7 +2004,8 @@ fn buildSkillInvocationPrompt(
 ) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.print("Apply the skill `{s}`.\n\n", .{skill.name});
     try writer.writeAll("## Skill Launch Context\n\n");
@@ -2021,6 +2024,7 @@ fn buildSkillInvocationPrompt(
     }
     try writer.writeAll("\n\n## Task\n\n");
     try writer.writeAll(user_input);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2030,7 +2034,8 @@ pub fn buildActiveSkillPromptSection(self: anytype) !?[]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.writeAll("## Active Skill Session\n\n");
     try writer.writeAll("An operator armed a session-scoped skill for this conversation. Treat subsequent user messages as work for that skill unless they explicitly clear or replace it.\n\n");
@@ -2050,6 +2055,7 @@ pub fn buildActiveSkillPromptSection(self: anytype) !?[]const u8 {
         }
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2333,7 +2339,8 @@ fn formatSkillBrowserRoot(self: anytype, skills: []const skills_mod.Skill) ![]co
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.print("Skill browser: {d} available skill(s).\n", .{available_total});
     if (@hasField(@TypeOf(self.*), "active_skill_name")) {
@@ -2361,6 +2368,7 @@ fn formatSkillBrowserRoot(self: anytype, skills: []const skills_mod.Skill) ![]co
         .{ .label = "Skill status", .submit_text = "/skill status" },
     };
     try appendSkillCommandChoices(self, writer, &choices, SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2374,7 +2382,8 @@ fn formatSkillListText(self: anytype, skills: []const skills_mod.Skill) ![]const
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.writeAll("Available skills:\n");
     for (refs) |skill| {
@@ -2399,6 +2408,7 @@ fn formatSkillListText(self: anytype, skills: []const skills_mod.Skill) ![]const
     }
 
     try writer.writeAll("\nUse `/skill <name>` to arm a non-interactive session skill, `/iskill <name>` for an interactive session skill, or `/skill <name> <task>` for a one-off skill task.");
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2417,13 +2427,15 @@ fn formatSkillRefListPage(
     if (!shouldRenderSkillChoices(self)) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const writer = &out_writer.writer;
         try writer.print("{s}:\n", .{title});
         for (refs) |skill| {
             try writer.print("  - {s}", .{skill.name});
             if (skill.description.len > 0) try writer.print(": {s}", .{skill.description});
             try writer.writeAll("\n");
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2433,7 +2445,8 @@ fn formatSkillRefListPage(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
         title,
@@ -2484,6 +2497,7 @@ fn formatSkillRefListPage(
     }
 
     try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2543,10 +2557,12 @@ fn formatSkillLetterGroupMenu(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
     try writer.print("Letter range {s}. Choose a starting letter.\n", .{parsed_group.label});
     try writer.writeAll("Matches include both the raw skill name and the base name after the first prefix.");
     try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2566,7 +2582,8 @@ fn formatSkillAffixMenu(
     if (!shouldRenderSkillChoices(self)) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const writer = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const writer = &out_writer.writer;
         try writer.print("{s}:\n", .{if (kind == .prefix) "Skill prefixes" else "Skill suffixes"});
         for (entries) |entry| {
             if (kind == .prefix) {
@@ -2575,6 +2592,7 @@ fn formatSkillAffixMenu(
                 try writer.print("  - -{s} ({d})\n", .{ entry.token, entry.count });
             }
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2585,7 +2603,8 @@ fn formatSkillAffixMenu(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
     try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
         if (kind == .prefix) "Skill prefixes" else "Skill suffixes",
         start + 1,
@@ -2639,6 +2658,7 @@ fn formatSkillAffixMenu(
     }
 
     try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2762,7 +2782,8 @@ fn formatSkillActivatedReply(
 ) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.print("Active skill set to `{s}` ({s}).\n", .{
         skill.name,
@@ -2773,16 +2794,19 @@ fn formatSkillActivatedReply(
     }
     try writer.writeAll("Send your next message to continue in this skill. Use /skill clear to leave it.");
     try appendSkillActionChoices(self, writer, true);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
 fn formatSkillInactiveReply(self: anytype, text: []const u8) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.writeAll(text);
     try appendSkillActionChoices(self, writer, false);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2805,7 +2829,8 @@ fn formatActiveSkillStatus(self: anytype) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const writer = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
 
     try writer.print("Active skill: {s}\n", .{self.active_skill_name.?});
     try writer.print("Mode: {s}\n", .{activeSkillModeLabel(self.active_skill_interactive)});
@@ -2824,6 +2849,7 @@ fn formatActiveSkillStatus(self: anytype) ![]const u8 {
     }
     try writer.writeAll("Use /skill clear to leave this skill session.");
     try appendSkillActionChoices(self, writer, true);
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3312,7 +3338,8 @@ fn resetRuntimeCommandState(self: anytype) void {
 fn formatStatus(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     const show_emojis = if (@hasField(@TypeOf(self.*), "status_show_emojis")) self.status_show_emojis else true;
     const title_prefix = if (show_emojis) "🌊 " else "";
@@ -3399,6 +3426,7 @@ fn formatStatus(self: anytype) ![]const u8 {
             );
         }
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3443,7 +3471,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print(
             "Exec: host={s} security={s} ask={s}",
             .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -3451,6 +3480,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (self.exec_node_id) |id| {
             try w.print(" node={s}", .{id});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -3481,7 +3511,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
     try w.print(
         "Exec set: host={s} security={s} ask={s}",
         .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -3489,6 +3520,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.exec_node_id) |id| {
         try w.print(" node={s}", .{id});
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3661,11 +3693,13 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.policy) |pol| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Allowlisted commands:\n");
         for (pol.allowed_commands) |cmd| {
             try w.print("  - {s}\n", .{cmd});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
     return try self.allocator.dupe(u8, "No runtime allowlist policy attached.");
@@ -3711,17 +3745,17 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     const raw_path = firstToken(arg);
     const path = if (raw_path.len == 0)
-        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std.time.timestamp() })
-    else if (std.fs.path.isAbsolute(raw_path))
+        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
+    else if (std_compat.fs.path.isAbsolute(raw_path))
         try self.allocator.dupe(u8, raw_path)
     else
         try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.workspace_dir, raw_path });
     defer self.allocator.free(path);
 
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
+    const file = if (std_compat.fs.path.isAbsolute(path))
+        try std_compat.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
     else
-        try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        try std_compat.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
     defer file.close();
     var out_buf: [4096]u8 = undefined;
     var bw = file.writer(&out_buf);
@@ -3893,8 +3927,8 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args = std.json.ObjectMap.init(arena);
-    try args.put("command", .{ .string = command });
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena, "command", .{ .string = command });
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -3994,7 +4028,8 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     manager.mutex.lock();
     defer manager.mutex.unlock();
@@ -4025,10 +4060,12 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     if (visible_count == 0) {
         try w.writeAll("No subagents tracked in this session.");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -4278,7 +4315,8 @@ fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handlePollCommand(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     var wrote_any = false;
     if (self.pending_exec_command) |cmd| {
@@ -4317,6 +4355,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (!wrote_any) {
         return try self.allocator.dupe(u8, "No pending approvals or background tasks.");
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -4536,7 +4575,7 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     const allocator = arena_ptr.allocator();
 
     const config_path = try config_mutator.defaultConfigPath(allocator);
-    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidPath;
     const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_module.Config{
@@ -4546,7 +4585,7 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
         .arena = arena_ptr,
     };
 
-    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
         defer file.close();
         const content = try file.readToEndAlloc(allocator, 1024 * 64);
         try cfg.parseJson(content);
@@ -4560,10 +4599,10 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     }
 
     if (cfg.channels.nostr) |ns| {
-        ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+        ns.config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     }
     {
-        const dir = std.fs.path.dirname(config_path) orelse ".";
+        const dir = std_compat.fs.path.dirname(config_path) orelse ".";
         const teams_mut = @constCast(cfg.channels.teams);
         for (teams_mut) |*tc| {
             tc.config_dir = dir;
@@ -4585,9 +4624,9 @@ fn hotReloadValueJson(
         if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            var model_obj = std.json.ObjectMap.init(arena.allocator());
-            try model_obj.put("provider", .{ .string = cfg.default_provider });
-            try model_obj.put("primary", .{ .string = model });
+            var model_obj: std.json.ObjectMap = .empty;
+            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
+            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
             return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
         }
 
@@ -5110,7 +5149,8 @@ pub fn composeFinalReply(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
@@ -5137,6 +5177,7 @@ pub fn composeFinalReply(
         ),
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -5347,7 +5388,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const report = mem_rt.diagnose();
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory resolved config:\n", .{});
         try w.print("  backend: {s}\n", .{r.primary_backend});
         try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
@@ -5368,6 +5410,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         } else {
             try w.print("  outbox_pending: n/a\n", .{});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -5434,7 +5477,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Search results: {d}\n", .{results.len});
         for (results, 0..) |c, idx| {
             try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
@@ -5444,10 +5488,10 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.print(" vector_score=n/a", .{});
             }
             try w.print(" source={s}\n", .{c.source});
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+            const preview = util.previewUtf8(c.snippet, 140);
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -5492,18 +5536,19 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const shown = @min(limit, filtered_total);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
         var written: usize = 0;
         for (entries) |e| {
             if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
             if (written >= shown) break;
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
+            const preview = util.previewUtf8(e.content, 120);
             try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, e.key, e.category.toString(), e.timestamp });
-            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             written += 1;
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
