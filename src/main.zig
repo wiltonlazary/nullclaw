@@ -469,12 +469,7 @@ fn appendAgentSessionListJson(out: anytype, sessions: []const yc.memory.SessionI
 }
 
 fn writeAgentSessionListJson(sessions: []const yc.memory.SessionInfo, total: u64) !void {
-    var buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-    appendAgentSessionListJson(out, sessions, total) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendAgentSessionListJson, .{ sessions, total });
 }
 
 fn appendAgentSessionDetailJson(out: anytype, session: yc.memory.SessionInfo) !void {
@@ -488,13 +483,7 @@ fn appendAgentSessionDetailJson(out: anytype, session: yc.memory.SessionInfo) !v
 }
 
 fn writeAgentSessionDetailJson(session: yc.memory.SessionInfo) void {
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendAgentSessionDetailJson(out, session) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendAgentSessionDetailJson, .{session});
 }
 
 fn appendAgentInvokeResponseJson(out: anytype, session_key: []const u8, response: []const u8, turn_count: u64) !void {
@@ -657,12 +646,7 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
         const turn_count: u64 = total / 2;
         const response_text = trimTrailingNewline(result.stdout);
 
-        var buf: [65536]u8 = undefined;
-        var bw = std_compat.fs.File.stdout().writer(&buf);
-        const out = &bw.interface;
-        appendAgentInvokeResponseJson(out, effective_session, response_text, turn_count) catch return;
-        out.writeAll("\n") catch return;
-        out.flush() catch return;
+        writeRenderedJsonLine(appendAgentInvokeResponseJson, .{ effective_session, response_text, turn_count });
         return;
     }
 
@@ -768,12 +752,7 @@ fn runAgentSessionsAdmin(allocator: std.mem.Allocator, sub_args: []const []const
             }
         }
 
-        var buf: [4096]u8 = undefined;
-        var bw = std_compat.fs.File.stdout().writer(&buf);
-        const out = &bw.interface;
-        appendAgentSessionTerminationJson(out, session_key) catch return;
-        out.writeAll("\n") catch return;
-        out.flush() catch return;
+        writeRenderedJsonLine(appendAgentSessionTerminationJson, .{session_key});
         return;
     }
 
@@ -1377,16 +1356,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         defer visible.deinit(allocator);
 
         if (json_mode) {
-            var buf: [65536]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            out.writeAll("[") catch return;
-            for (visible.skills, 0..) |skill, idx| {
-                if (idx > 0) out.writeAll(",") catch return;
-                writeSkillJson(out, cfg.workspace_dir, visible.community_base, skill) catch return;
-            }
-            out.writeAll("]\n") catch return;
-            out.flush() catch return;
+            writeSkillListJson(cfg.workspace_dir, visible.community_base, visible.skills);
         } else {
             if (visible.skills.len == 0) {
                 std.debug.print("No skills installed.\n", .{});
@@ -1490,11 +1460,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
         const skill = findSkillByName(visible.skills, sub_args[1]) orelse {
             if (json_mode) {
-                var buf: [64]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                out.writeAll("null\n") catch return;
-                out.flush() catch return;
+                printStdoutBytes("null\n");
                 return;
             } else {
                 std.debug.print("Skill '{s}' not found or invalid.\n", .{sub_args[1]});
@@ -1503,12 +1469,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         };
 
         if (json_mode) {
-            var buf: [65536]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            writeSkillJson(out, cfg.workspace_dir, visible.community_base, skill.*) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeSkillDetailJson(cfg.workspace_dir, visible.community_base, skill.*);
         } else {
             std.debug.print("Skill: {s}\n", .{skill.name});
             std.debug.print("  Version:     {s}\n", .{skill.version});
@@ -1771,7 +1732,7 @@ fn findSkillByName(skills: []const yc.skills.Skill, name: []const u8) ?*const yc
 
 fn writeJsonString(out: anytype, s: []const u8) !void {
     try out.writeByte('"');
-    writeJsonEscaped(out, s);
+    try writeJsonEscaped(out, s);
     try out.writeByte('"');
 }
 
@@ -1811,21 +1772,20 @@ fn writeJsonBool(out: anytype, value: bool) !void {
     try out.writeAll(if (value) "true" else "false");
 }
 
-fn writeJsonError(code: []const u8, message: []const u8, backend: ?[]const u8) void {
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    out.writeAll("{\"error\":") catch return;
-    writeJsonString(out, code) catch return;
-    out.writeAll(",\"message\":") catch return;
-    writeJsonString(out, message) catch return;
+fn appendJsonError(out: anytype, code: []const u8, message: []const u8, backend: ?[]const u8) !void {
+    try out.writeAll("{\"error\":");
+    try writeJsonString(out, code);
+    try out.writeAll(",\"message\":");
+    try writeJsonString(out, message);
     if (backend) |value| {
-        out.writeAll(",\"backend\":") catch return;
-        writeJsonString(out, value) catch return;
+        try out.writeAll(",\"backend\":");
+        try writeJsonString(out, value);
     }
-    out.writeAll("}\n") catch return;
-    out.flush() catch return;
+    try out.writeAll("}");
+}
+
+fn writeJsonError(code: []const u8, message: []const u8, backend: ?[]const u8) void {
+    writeRenderedJsonLine(appendJsonError, .{ code, message, backend });
 }
 
 fn appendConfigMutationJson(
@@ -1856,12 +1816,7 @@ fn writeConfigMutationJson(
     action: yc.config_mutator.MutationAction,
     result: *const yc.config_mutator.MutationResult,
 ) void {
-    var buf: [8192]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-    appendConfigMutationJson(out, action, result) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendConfigMutationJson, .{ action, result });
 }
 
 fn modelCanonicalProvider(raw_model: []const u8) ?[]const u8 {
@@ -1882,9 +1837,9 @@ fn appendModelInfoJson(out: anytype, model_name: []const u8) !void {
         const slash = std.mem.indexOfScalar(u8, model_name, '/').?;
         if (slash + 1 < model_name.len) {
             try out.writeByte('"');
-            writeJsonEscaped(out, canonical_provider);
+            try writeJsonEscaped(out, canonical_provider);
             try out.writeByte('/');
-            writeJsonEscaped(out, model_name[slash + 1 ..]);
+            try writeJsonEscaped(out, model_name[slash + 1 ..]);
             try out.writeByte('"');
         } else {
             try writeJsonString(out, canonical_provider);
@@ -1896,12 +1851,7 @@ fn appendModelInfoJson(out: anytype, model_name: []const u8) !void {
 }
 
 fn writeModelInfoJson(model_name: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-    appendModelInfoJson(out, model_name) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendModelInfoJson, .{model_name});
 }
 
 fn appendCronJobJson(out: anytype, job: *const yc.cron.CronJob) !void {
@@ -1941,13 +1891,7 @@ fn appendCronJobJson(out: anytype, job: *const yc.cron.CronJob) !void {
 }
 
 fn writeCronJobJson(job: *const yc.cron.CronJob) void {
-    var buf: [16384]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendCronJobJson(out, job) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendCronJobJson, .{job});
 }
 
 fn appendCronRunsJson(out: anytype, runs: []const yc.cron.CronRun) !void {
@@ -1968,13 +1912,7 @@ fn appendCronRunsJson(out: anytype, runs: []const yc.cron.CronRun) !void {
 }
 
 fn writeCronRunsJson(runs: []const yc.cron.CronRun) void {
-    var buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendCronRunsJson(out, runs) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendCronRunsJson, .{runs});
 }
 
 fn writeSkillJson(
@@ -2004,6 +1942,36 @@ fn writeSkillJson(
     try out.writeAll(",\"source\":");
     try writeJsonString(out, skillSource(workspace_dir, community_base, skill));
     try out.print(",\"instructions_bytes\":{d}}}", .{skill.instructions.len});
+}
+
+fn appendSkillListJson(
+    out: anytype,
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skills: []const yc.skills.Skill,
+) !void {
+    try out.writeAll("[");
+    for (skills, 0..) |skill, idx| {
+        if (idx > 0) try out.writeAll(",");
+        try writeSkillJson(out, workspace_dir, community_base, skill);
+    }
+    try out.writeAll("]");
+}
+
+fn writeSkillListJson(
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skills: []const yc.skills.Skill,
+) void {
+    writeRenderedJsonLine(appendSkillListJson, .{ workspace_dir, community_base, skills });
+}
+
+fn writeSkillDetailJson(
+    workspace_dir: []const u8,
+    community_base: ?[]const u8,
+    skill: yc.skills.Skill,
+) void {
+    writeRenderedJsonLine(writeSkillJson, .{ workspace_dir, community_base, skill });
 }
 
 fn memoryEntryVisible(include_internal: bool, entry: yc.memory.MemoryEntry) bool {
@@ -2125,6 +2093,52 @@ fn appendMemorySearchResultsJson(out: anytype, results: []const yc.memory.Retrie
     try out.writeAll("]");
 }
 
+fn appendMemoryListJson(
+    out: anytype,
+    entries: []const yc.memory.MemoryEntry,
+    shown: usize,
+    include_internal: bool,
+) !void {
+    try out.writeAll("[");
+    var written: usize = 0;
+    for (entries) |entry| {
+        if (!memoryEntryVisible(include_internal, entry)) continue;
+        if (written >= shown) break;
+        if (written > 0) try out.writeAll(",");
+        try writeMemoryEntryJson(out, entry);
+        written += 1;
+    }
+    try out.writeAll("]");
+}
+
+fn writeMemoryStatsJson(payload: MemoryStatsPayload) void {
+    writeRenderedJsonLine(appendMemoryStatsJson, .{payload});
+}
+
+fn writeMemoryMaintenanceJsonLine(field_name: []const u8, count: usize, skipped: ?bool) void {
+    writeRenderedJsonLine(appendMemoryMaintenanceJson, .{ field_name, count, skipped });
+}
+
+fn writeMemoryDeleteJsonLine(key: []const u8, session_id: ?[]const u8, deleted: bool) void {
+    writeRenderedJsonLine(appendMemoryDeleteJson, .{ key, session_id, deleted });
+}
+
+fn writeMemoryEntryJsonLine(entry: yc.memory.MemoryEntry) void {
+    writeRenderedJsonLine(writeMemoryEntryJson, .{entry});
+}
+
+fn writeMemoryListJson(entries: []const yc.memory.MemoryEntry, shown: usize, include_internal: bool) void {
+    writeRenderedJsonLine(appendMemoryListJson, .{ entries, shown, include_internal });
+}
+
+fn writeMemorySearchResultsJsonLine(results: []const yc.memory.RetrievalCandidate) void {
+    writeRenderedJsonLine(appendMemorySearchResultsJson, .{results});
+}
+
+fn writeMemoryMutationJsonLine(action: []const u8, entry: yc.memory.MemoryEntry) void {
+    writeRenderedJsonLine(appendMemoryMutationJson, .{ action, entry });
+}
+
 fn appendAgentSessionTerminationJson(out: anytype, session_key: []const u8) !void {
     try out.writeAll("{\"session_key\":");
     try writeJsonString(out, session_key);
@@ -2207,10 +2221,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const r = mem_rt.resolved;
         const report = mem_rt.diagnose();
         if (json_mode) {
-            var buf: [8192]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendMemoryStatsJson(out, .{
+            writeMemoryStatsJson(.{
                 .backend = r.primary_backend,
                 .retrieval = r.retrieval_mode,
                 .vector = r.vector_mode,
@@ -2222,9 +2233,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 .entries = report.entry_count,
                 .vector_entries = report.vector_entry_count,
                 .outbox_pending = report.outbox_pending,
-            }) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            });
         } else {
             std.debug.print("Memory stats:\n", .{});
             std.debug.print("  backend: {s}\n", .{r.primary_backend});
@@ -2264,12 +2273,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const count = mem_rt.reindex(allocator);
         const skipped = std.mem.eql(u8, mem_rt.resolved.vector_mode, "none");
         if (json_mode) {
-            var buf: [256]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendMemoryMaintenanceJson(out, "reindexed", count, skipped) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeMemoryMaintenanceJsonLine("reindexed", count, skipped);
         } else if (skipped) {
             std.debug.print("Vector plane is disabled; reindex skipped (0 entries).\n", .{});
         } else {
@@ -2282,12 +2286,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const json_mode = hasJsonFlag(sub_args[1..]);
         const drained = mem_rt.drainOutbox(allocator);
         if (json_mode) {
-            var buf: [256]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendMemoryMaintenanceJson(out, "drained", drained, null) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeMemoryMaintenanceJsonLine("drained", drained, null);
         } else {
             std.debug.print("Outbox drain complete: {d} operation(s) processed.\n", .{drained});
         }
@@ -2365,23 +2364,13 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 mem_rt.deleteFromVectorStore(key, sid_opt);
             }
             if (json_mode) {
-                var buf: [2048]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                appendMemoryDeleteJson(out, key, session_id, true) catch return;
-                out.writeAll("\n") catch return;
-                out.flush() catch return;
+                writeMemoryDeleteJsonLine(key, session_id, true);
             } else {
                 std.debug.print("Deleted memory entry: {s}\n", .{key});
             }
         } else {
             if (json_mode) {
-                var buf: [2048]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                appendMemoryDeleteJson(out, key, session_id, false) catch return;
-                out.writeAll("\n") catch return;
-                out.flush() catch return;
+                writeMemoryDeleteJsonLine(key, session_id, false);
             } else {
                 std.debug.print("Entry not deleted (missing or backend is append-only): {s}\n", .{key});
             }
@@ -2421,12 +2410,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         if (entry) |e| {
             defer e.deinit(allocator);
             if (json_mode) {
-                var buf: [65536]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                writeMemoryEntryJson(out, e) catch return;
-                out.writeAll("\n") catch return;
-                out.flush() catch return;
+                writeMemoryEntryJsonLine(e);
             } else {
                 std.debug.print("key: {s}\ncategory: {s}\ntimestamp: {s}\ncontent:\n{s}\n", .{
                     e.key,
@@ -2437,11 +2421,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         } else {
             if (json_mode) {
-                var buf: [64]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                out.writeAll("null\n") catch return;
-                out.flush() catch return;
+                printStdoutBytes("null\n");
             } else {
                 std.debug.print("Not found: {s}\n", .{key});
             }
@@ -2506,20 +2486,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         const shown = @min(limit, visible_total);
 
         if (json_mode) {
-            var buf: [65536]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            out.writeAll("[") catch return;
-            var written: usize = 0;
-            for (entries) |e| {
-                if (!memoryEntryVisible(include_internal, e)) continue;
-                if (written >= shown) break;
-                if (written > 0) out.writeAll(",") catch return;
-                writeMemoryEntryJson(out, e) catch return;
-                written += 1;
-            }
-            out.writeAll("]\n") catch return;
-            out.flush() catch return;
+            writeMemoryListJson(entries, shown, include_internal);
         } else {
             std.debug.print("Memory entries: showing {d}/{d}\n", .{ shown, visible_total });
             var written: usize = 0;
@@ -2585,12 +2552,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         defer yc.memory.retrieval.freeCandidates(allocator, results);
 
         if (json_mode) {
-            var buf: [65536]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendMemorySearchResultsJson(out, results) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeMemorySearchResultsJsonLine(results);
         } else {
             std.debug.print("Search results: {d}\n", .{results.len});
             for (results, 0..) |rc, idx| {
@@ -2668,12 +2630,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         if (stored) |entry| {
             defer entry.deinit(allocator);
             if (json_mode) {
-                var buf: [65536]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&buf);
-                const out = &bw.interface;
-                appendMemoryMutationJson(out, if (std.mem.eql(u8, subcmd, "update")) "update" else "store", entry) catch return;
-                out.writeAll("\n") catch return;
-                out.flush() catch return;
+                writeMemoryMutationJsonLine(if (std.mem.eql(u8, subcmd, "update")) "update" else "store", entry);
             } else {
                 std.debug.print("Stored memory entry: {s}\n", .{key});
             }
@@ -2951,13 +2908,7 @@ fn appendHistoryListJson(out: anytype, sessions: []const yc.memory.SessionInfo, 
 }
 
 fn writeHistoryListJson(sessions: []const yc.memory.SessionInfo, total: u64, limit: usize, offset: usize) void {
-    var buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendHistoryListJson(out, sessions, total, limit, offset) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendHistoryListJson, .{ sessions, total, limit, offset });
 }
 
 fn appendHistoryShowJson(out: anytype, session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) !void {
@@ -2978,28 +2929,22 @@ fn appendHistoryShowJson(out: anytype, session_id: []const u8, messages: []const
 }
 
 fn writeHistoryShowJson(session_id: []const u8, messages: []const yc.memory.DetailedMessageEntry, total: u64, limit: usize, offset: usize) void {
-    var buf: [65536]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendHistoryShowJson(out, session_id, messages, total, limit, offset) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendHistoryShowJson, .{ session_id, messages, total, limit, offset });
 }
 
-fn writeJsonEscaped(out: anytype, s: []const u8) void {
+fn writeJsonEscaped(out: anytype, s: []const u8) !void {
     for (s) |ch| {
         switch (ch) {
-            '"' => out.writeAll("\\\"") catch return,
-            '\\' => out.writeAll("\\\\") catch return,
-            '\n' => out.writeAll("\\n") catch return,
-            '\r' => out.writeAll("\\r") catch return,
-            '\t' => out.writeAll("\\t") catch return,
+            '"' => try out.writeAll("\\\""),
+            '\\' => try out.writeAll("\\\\"),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
             else => {
                 if (ch < 0x20) {
-                    out.print("\\u{x:0>4}", .{ch}) catch return;
+                    try out.print("\\u{x:0>4}", .{ch});
                 } else {
-                    out.writeByte(ch) catch return;
+                    try out.writeByte(ch);
                 }
             },
         }
@@ -3153,7 +3098,7 @@ fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !
         try yc.capabilities.buildSummaryText(allocator, cfg_ptr, null);
     defer allocator.free(output);
 
-    std.debug.print("{s}", .{output});
+    try yc.admin_output.writeStdoutBytes(output);
 }
 
 // ── Config ───────────────────────────────────────────────────────
@@ -3164,7 +3109,14 @@ const ModelProviderSummary = struct {
 };
 
 fn printStdoutBytes(text: []const u8) void {
-    std_compat.fs.File.stdout().writeAll(text) catch return;
+    yc.admin_output.writeStdoutBytes(text) catch return;
+}
+
+fn writeRenderedJsonLine(comptime render_fn: anytype, args: anytype) void {
+    const allocator = std.heap.smp_allocator;
+    yc.admin_output.writeRenderedLine(allocator, render_fn, args) catch {
+        std_compat.process.exit(1);
+    };
 }
 
 fn appendJsonEscaped(buf: *std.array_list.Managed(u8), s: []const u8) !void {
@@ -3273,13 +3225,7 @@ fn appendValidationJson(out: anytype, valid: bool) !void {
 }
 
 fn writeConfigValueResult(path: []const u8, value_json: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
-    const out = &bw.interface;
-
-    appendConfigValueResult(out, path, value_json) catch return;
-    out.writeAll("\n") catch return;
-    out.flush() catch return;
+    writeRenderedJsonLine(appendConfigValueResult, .{ path, value_json });
 }
 
 fn printConfigUsage() void {
@@ -3438,12 +3384,7 @@ fn runConfig(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         };
 
         if (hasJsonFlag(sub_args[1..])) {
-            var buf: [256]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendConfigReloadJson(out) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeRenderedJsonLine(appendConfigReloadJson, .{});
         } else {
             std.debug.print("Config re-read from disk. Restart running daemons to apply changes.\n", .{});
         }
@@ -3480,12 +3421,7 @@ fn runConfig(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
 
         if (json_mode) {
-            var buf: [64]u8 = undefined;
-            var bw = std_compat.fs.File.stdout().writer(&buf);
-            const out = &bw.interface;
-            appendValidationJson(out, true) catch return;
-            out.writeAll("\n") catch return;
-            out.flush() catch return;
+            writeRenderedJsonLine(appendValidationJson, .{true});
         } else {
             std.debug.print("Config validation: OK\n", .{});
         }
@@ -5444,6 +5380,34 @@ test "appendHistoryShowJson renders paginated message history" {
     );
 }
 
+test "admin output renders large history payloads without truncation" {
+    const allocator = std.testing.allocator;
+    const large_content = try allocator.alloc(u8, 80_000);
+    defer allocator.free(large_content);
+    @memset(large_content, 'x');
+
+    const messages = [_]yc.memory.DetailedMessageEntry{
+        .{
+            .role = "assistant",
+            .content = large_content,
+            .created_at = "2026-04-17T00:00:01Z",
+        },
+    };
+
+    const rendered = try yc.admin_output.renderBytes(allocator, appendHistoryShowJson, .{
+        "s-large",
+        &messages,
+        @as(u64, 1),
+        @as(usize, 100),
+        @as(usize, 0),
+    });
+    defer allocator.free(rendered);
+
+    try std.testing.expect(rendered.len > 80_000);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"session_id\":\"s-large\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"role\":\"assistant\"") != null);
+}
+
 test "appendConfigMutationJson renders persisted config mutation result" {
     const result: yc.config_mutator.MutationResult = .{
         .path = "gateway.port",
@@ -5647,6 +5611,29 @@ test "appendMemoryMutationJson renders store and update payloads" {
         "{\"action\":\"store\",\"entry\":{\"key\":\"fact\",\"category\":\"conversation\",\"timestamp\":\"2026-04-17T00:00:00Z\",\"content\":\"hello\",\"session_id\":\"s-1\"}}",
         writer.buffered(),
     );
+}
+
+test "admin output renders large memory entries without truncation" {
+    const allocator = std.testing.allocator;
+    const large_content = try allocator.alloc(u8, 90_000);
+    defer allocator.free(large_content);
+    @memset(large_content, 'm');
+
+    const entry = yc.memory.MemoryEntry{
+        .id = "entry-large",
+        .key = "fact",
+        .category = .conversation,
+        .timestamp = "2026-04-17T00:00:00Z",
+        .content = large_content,
+        .session_id = "s-large",
+    };
+
+    const rendered = try yc.admin_output.renderBytes(allocator, writeMemoryEntryJson, .{entry});
+    defer allocator.free(rendered);
+
+    try std.testing.expect(rendered.len > 90_000);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"key\":\"fact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"session_id\":\"s-large\"") != null);
 }
 
 test "appendMemoryDeleteJson renders delete outcome payload" {

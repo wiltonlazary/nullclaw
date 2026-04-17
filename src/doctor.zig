@@ -19,6 +19,7 @@ const fs_compat = @import("fs_compat.zig");
 const builtin = @import("builtin");
 const health = @import("health.zig");
 const json_util = @import("json_util.zig");
+const admin_output = @import("admin_output.zig");
 const version = @import("version.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
@@ -229,7 +230,7 @@ const GatewayDoctorFetch = enum {
 };
 
 fn printStdoutBytes(text: []const u8) void {
-    std_compat.fs.File.stdout().writeAll(text) catch return;
+    admin_output.writeStdoutBytes(text) catch return;
 }
 
 fn printGatewayDoctorJson(allocator: std.mem.Allocator) GatewayDoctorFetch {

@@ -7,6 +7,7 @@ const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
 const observability = @import("observability.zig");
+const admin_output = @import("admin_output.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
@@ -1727,7 +1728,7 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
 }
 
 fn printStdoutBytes(text: []const u8) void {
-    std_compat.fs.File.stdout().writeAll(text) catch return;
+    admin_output.writeStdoutBytes(text) catch return;
 }
 
 fn appendNullableString(

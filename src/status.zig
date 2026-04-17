@@ -6,13 +6,14 @@ const channel_catalog = @import("channel_catalog.zig");
 const cron = @import("cron.zig");
 const health = @import("health.zig");
 const json_util = @import("json_util.zig");
+const admin_output = @import("admin_output.zig");
 
 fn printUsage() void {
     std.debug.print("Usage: nullclaw status [--json]\n", .{});
 }
 
 fn printStdoutBytes(text: []const u8) void {
-    std_compat.fs.File.stdout().writeAll(text) catch return;
+    admin_output.writeStdoutBytes(text) catch return;
 }
 
 fn appendNullableString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: ?[]const u8) !void {
