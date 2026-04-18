@@ -167,6 +167,7 @@ pub const ToolSpec = struct {
 pub const Tool = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    custom_description: ?[]const u8 = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, args: JsonObjectMap) anyerror!ToolResult,
@@ -185,6 +186,7 @@ pub const Tool = struct {
     }
 
     pub fn description(self: Tool) []const u8 {
+        if (self.custom_description) |desc| return desc;
         return self.vtable.description(self.ptr);
     }
 
@@ -563,6 +565,29 @@ pub fn allTools(
             try list.append(allocator, t);
         }
     }
+
+    var write_idx: usize = 0;
+    for (list.items) |*t| {
+        var keep = true;
+        for (opts.tools_config.tool_customizations) |cust| {
+            if (std.mem.eql(u8, t.name(), cust.name)) {
+                if (!cust.enabled) {
+                    keep = false;
+                    t.deinit(allocator);
+                    break;
+                }
+                if (cust.system_prompt) |prompt| {
+                    t.custom_description = prompt;
+                }
+                break;
+            }
+        }
+        if (keep) {
+            list.items[write_idx] = t.*;
+            write_idx += 1;
+        }
+    }
+    list.shrinkRetainingCapacity(write_idx);
 
     return list.toOwnedSlice(allocator);
 }
