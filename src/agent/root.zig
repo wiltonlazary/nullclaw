@@ -513,6 +513,7 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
             .exec_security = resolved_exec_security,
@@ -1625,7 +1626,7 @@ pub const Agent = struct {
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
-        const effective_user_message = blk: {
+        var effective_user_message: []const u8 = blk: {
             if (turn_input.invoke_local_handler) {
                 const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
                 if (turn_input.llm_user_message) |llm_user_message| {
@@ -1637,6 +1638,29 @@ pub const Agent = struct {
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
+        var effective_user_message_owned = false;
+        defer if (effective_user_message_owned) self.allocator.free(effective_user_message);
+
+        // Process tool triggers to inject PRIORITY hints natively into the LLM context
+        if (self.tools_config.tool_customizations.len > 0) {
+            var highest_priority: u8 = 0;
+            var priority_tool: ?[]const u8 = null;
+            for (self.tools_config.tool_customizations) |custom| {
+                if (!custom.enabled or custom.triggers.len == 0) continue;
+                for (custom.triggers) |kw| {
+                    if (containsAsciiIgnoreCase(effective_user_message, kw)) {
+                        if (custom.priority >= highest_priority) {
+                            highest_priority = custom.priority;
+                            priority_tool = custom.name;
+                        }
+                    }
+                }
+            }
+            if (priority_tool) |pn| {
+                effective_user_message = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
+                effective_user_message_owned = true;
+            }
+        }
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
@@ -9826,4 +9850,6 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
+}
+extra"));
 }
