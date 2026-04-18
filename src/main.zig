@@ -87,7 +87,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\
     \\OPTIONS:
     \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
-    \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
+    \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--skill SKILL]
     \\  gateway [--port PORT] [--host HOST]
     \\  status [--json]
     \\  version | --version | -V
@@ -379,6 +379,7 @@ fn printAgentUsage() void {
         \\  --provider PROVIDER           Override default provider
         \\  --model MODEL                 Override default model
         \\  --temperature TEMP            Override sampling temperature
+        \\  --skill SKILL                 Activate a named skill at startup
         \\  --verbose, -v                 Enable verbose logging
         \\  --help, -h                    Show this help
         \\

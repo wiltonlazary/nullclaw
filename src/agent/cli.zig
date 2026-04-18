@@ -34,6 +34,7 @@ const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
+const commands = @import("commands.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -165,6 +166,7 @@ const ParsedAgentArgs = struct {
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
     agent_name: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
     verbose: bool = false,
 };
 
@@ -204,6 +206,10 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.agent_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--skill")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.skill_name = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
@@ -511,6 +517,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (agent_memory_session_id) |memory_session_id| {
             agent.memory_session_id = memory_session_id;
         }
+        if (parsed_args.skill_name) |sname| {
+            _ = try commands.activateSkillByName(&agent, sname);
+        }
         defer agent.deinit();
 
         // Enable streaming if provider supports it
@@ -621,6 +630,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.memory_session_id = sid;
     } else if (agent_memory_session_id) |memory_session_id| {
         agent.memory_session_id = memory_session_id;
+    }
+    if (parsed_args.skill_name) |sname| {
+        _ = try commands.activateSkillByName(&agent, sname);
     }
     defer agent.deinit();
 
@@ -1045,6 +1057,24 @@ test "parseAgentArgs returns missing value for --agent" {
     const args = [_][]const u8{"--agent"};
     switch (parseAgentArgs(&args)) {
         .missing_value => |value| try std.testing.expectEqualStrings("--agent", value),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs parses --skill" {
+    const args = [_][]const u8{ "--skill", "news-digest", "-m", "go" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("news-digest", parsed.skill_name.?);
+    try std.testing.expectEqualStrings("go", parsed.message_arg.?);
+}
+
+test "parseAgentArgs returns missing value for --skill" {
+    const args = [_][]const u8{"--skill"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("--skill", value),
         else => unreachable,
     }
 }
