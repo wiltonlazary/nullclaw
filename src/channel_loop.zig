@@ -29,6 +29,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
+const inbound_router = @import("inbound_router.zig");
 const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
@@ -975,6 +976,19 @@ fn processTelegramMessage(
         .draft_id = draft_turn_id,
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
+
+    switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
+        .inject, .replace_injection => {
+            runtime.session_mgr.injectMidTurn(session_key, content) catch |err|
+                log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
+            return;
+        },
+        .drop => {
+            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
+            return;
+        },
+        .process, .queue => {},
+    }
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
@@ -2390,6 +2404,19 @@ pub fn runMaxLoop(
                 routed_session_key = route.session_key;
                 break :blk route.session_key;
             };
+
+            switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
+                .inject, .replace_injection => {
+                    runtime.session_mgr.injectMidTurn(session_key, msg.content) catch |err|
+                        log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
+                    continue;
+                },
+                .drop => {
+                    log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
+                    continue;
+                },
+                .process, .queue => {},
+            }
 
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
