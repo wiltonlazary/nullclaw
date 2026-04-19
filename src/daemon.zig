@@ -25,6 +25,7 @@ const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const inbound_debounce = @import("inbound_debounce.zig");
+const inbound_router = @import("inbound_router.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const outbound = @import("outbound.zig");
@@ -1210,6 +1211,19 @@ fn inboundDispatcherThread(
             );
             defer if (routed_session_key) |key| allocator.free(key);
             const session_key = routed_session_key orelse msg.session_key;
+
+            switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
+                .inject, .replace_injection => {
+                    runtime.session_mgr.injectMidTurn(session_key, msg.content) catch |err|
+                        log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
+                    continue;
+                },
+                .drop => {
+                    log.info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
+                    continue;
+                },
+                .process, .queue => {},
+            }
 
             const typing_recipient = sendInboundProcessingIndicator(
                 allocator,
