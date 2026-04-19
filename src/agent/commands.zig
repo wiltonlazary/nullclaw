@@ -3142,8 +3142,26 @@ fn findSubagentManager(self: anytype) ?*subagent_mod.SubagentManager {
 
 pub fn refreshSubagentToolContext(self: anytype) void {
     const spawn_tool = findSpawnTool(self) orelse return;
-    spawn_tool.default_channel = "agent";
-    spawn_tool.default_chat_id = self.memory_session_id orelse "agent";
+    var route_channel: []const u8 = "agent";
+    var route_chat_id: []const u8 = self.memory_session_id orelse "agent";
+    var route_account_id: ?[]const u8 = null;
+
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |channel| route_channel = channel;
+            route_account_id = ctx.account_id;
+            if (ctx.delivery_chat_id) |delivery_chat_id| {
+                route_chat_id = delivery_chat_id;
+            } else if (ctx.peer_id) |peer_id| {
+                route_chat_id = peer_id;
+            }
+        }
+    }
+
+    spawn_tool.default_channel = route_channel;
+    spawn_tool.default_account_id = route_account_id;
+    spawn_tool.default_chat_id = route_chat_id;
+    spawn_tool.default_session_key = self.memory_session_id orelse route_chat_id;
 }
 
 fn findShellTool(self: anytype) ?Tool {
@@ -4079,7 +4097,7 @@ fn spawnSubagentTask(self: anytype, task: []const u8, label: []const u8, agent_n
         return try self.allocator.dupe(u8, "Spawn tool is not enabled.");
 
     const origin_chat = self.memory_session_id orelse "agent";
-    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, agent_name) catch |err| {
+    const task_id = manager.spawnWithAgent(trimmed_task, label, "agent", origin_chat, null, origin_chat, agent_name) catch |err| {
         return switch (err) {
             error.TooManyConcurrentSubagents => try self.allocator.dupe(u8, "Too many concurrent subagents. Wait for a task to finish."),
             error.UnknownAgent => if (agent_name) |name|
