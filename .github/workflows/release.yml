@@ -199,7 +199,19 @@ jobs:
             zip -9 ../../nullclaw-windows-aarch64.zip nullclaw.exe
           )
 
+      - name: Check whether release already exists
+        id: release_exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create release
+        if: steps.release_exists.outputs.value != 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
@@ -218,6 +230,26 @@ jobs:
             nullclaw-windows-x86_64.zip
             nullclaw-windows-aarch64.zip
           generate_release_notes: true
+
+      - name: Update existing release assets
+        if: steps.release_exists.outputs.value == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            nullclaw-linux-x86_64.bin
+            nullclaw-linux-aarch64.bin
+            nullclaw-linux-arm32-gnu.bin
+            nullclaw-linux-arm32-musl.bin
+            nullclaw-linux-riscv64.bin
+            nullclaw-android-aarch64.bin
+            nullclaw-android-armv7.bin
+            nullclaw-android-x86_64.bin
+            nullclaw-macos-aarch64.bin
+            nullclaw-macos-x86_64.bin
+            nullclaw-windows-x86_64.exe
+            nullclaw-windows-aarch64.exe
+            nullclaw-windows-x86_64.zip
+            nullclaw-windows-aarch64.zip
 
   docker:
     needs: release
@@ -264,6 +296,7 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ steps.docker_version.outputs.value }}
+            ZIG_VERSION=${{ env.ZIG_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
