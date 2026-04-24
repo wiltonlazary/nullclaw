@@ -805,6 +805,7 @@ pub fn listSkillsMerged(allocator: std.mem.Allocator, builtin_dir: []const u8, w
 /// - git://host/owner/repo(.git)
 /// - git@host:owner/repo(.git)
 fn isGitSource(source: []const u8) bool {
+    if (isHttpsSource(source) and isWebSkillEndpointSource(source)) return false;
     return isGitSchemeSource(source, "https://") or
         isGitSchemeSource(source, "ssh://") or
         isGitSchemeSource(source, "git://") or
@@ -1002,6 +1003,16 @@ fn isWebSkillArtifactSource(source: []const u8) bool {
         endsWithAsciiIgnoreCase(normalized, ".zip");
 }
 
+fn isWebSkillEndpointSource(source: []const u8) bool {
+    const normalized = stripQueryAndFragment(normalizeWebSkillSource(source));
+    return std.mem.endsWith(u8, normalized, WEB_SKILL_MANIFEST_PATH) or
+        std.mem.endsWith(u8, normalized, WEB_SKILL_DEFAULT_PATH) or
+        std.mem.endsWith(u8, normalized, WEB_SKILL_FALLBACK_PATH) or
+        std.mem.indexOf(u8, normalized, WEB_SKILL_COLLECTION_PREFIX) != null or
+        std.mem.endsWith(u8, normalized, WEB_SKILL_COLLECTION_PATH) or
+        isWebSkillArtifactSource(normalized);
+}
+
 fn detectWebSkillSelection(source: []const u8) WebSkillSelection {
     const normalized = stripQueryAndFragment(normalizeWebSkillSource(source));
     if (std.mem.endsWith(u8, normalized, WEB_SKILL_INDEX_PATH) or
@@ -1107,11 +1118,21 @@ fn detectWebSkillArchiveKind(url: []const u8) ?WebSkillArchiveKind {
     return null;
 }
 
-fn isSafeArchiveRelativePath(path: []const u8) bool {
-    if (path.len == 0 or path[0] == '/' or path[0] == '\\') return false;
-    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
+const ArchivePathKind = enum {
+    file,
+    directory,
+};
 
-    var it = std.mem.splitScalar(u8, path, '/');
+fn isSafeArchiveRelativePath(path: []const u8, kind: ArchivePathKind) bool {
+    var normalized = path;
+    if (kind == .directory and normalized.len > 0 and normalized[normalized.len - 1] == '/') {
+        normalized = normalized[0 .. normalized.len - 1];
+    }
+
+    if (normalized.len == 0 or normalized[0] == '/' or normalized[0] == '\\') return false;
+    if (std.mem.indexOfScalar(u8, normalized, '\\') != null) return false;
+
+    var it = std.mem.splitScalar(u8, normalized, '/');
     while (it.next()) |part| {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
     }
@@ -1138,10 +1159,12 @@ fn validateTarGzArchiveFile(path: []const u8) !void {
     var total_unpacked: u64 = 0;
     var saw_skill_md = false;
     while (try it.next()) |entry| {
-        if (!isSafeArchiveRelativePath(entry.name)) return error.SkillSecurityAuditFailed;
         switch (entry.kind) {
-            .directory => {},
+            .directory => {
+                if (!isSafeArchiveRelativePath(entry.name, .directory)) return error.SkillSecurityAuditFailed;
+            },
             .file => {
+                if (!isSafeArchiveRelativePath(entry.name, .file)) return error.SkillSecurityAuditFailed;
                 total_unpacked = std.math.add(u64, total_unpacked, entry.size) catch return error.SkillSecurityAuditFailed;
                 if (total_unpacked > WEB_SKILL_ARCHIVE_MAX_UNPACKED_BYTES) return error.SkillSecurityAuditFailed;
                 if (std.mem.eql(u8, entry.name, "SKILL.md")) saw_skill_md = true;
@@ -1186,9 +1209,10 @@ fn validateZipArchiveFile(path: []const u8) !void {
         try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
         try reader.interface.readSliceAll(filename_buf[0..entry.filename_len]);
         const entry_name = filename_buf[0..entry.filename_len];
-        if (!isSafeArchiveRelativePath(entry_name)) return error.SkillSecurityAuditFailed;
+        const is_dir = entry_name.len > 0 and entry_name[entry_name.len - 1] == '/';
+        if (!isSafeArchiveRelativePath(entry_name, if (is_dir) .directory else .file)) return error.SkillSecurityAuditFailed;
 
-        if (entry_name[entry_name.len - 1] != '/') {
+        if (!is_dir) {
             total_unpacked = std.math.add(u64, total_unpacked, entry.uncompressed_size) catch return error.SkillSecurityAuditFailed;
             if (total_unpacked > WEB_SKILL_ARCHIVE_MAX_UNPACKED_BYTES) return error.SkillSecurityAuditFailed;
             if (std.mem.eql(u8, entry_name, "SKILL.md")) saw_skill_md = true;
@@ -2441,15 +2465,23 @@ pub fn installSkillWithDetail(
     }
     if (isHttpsSource(source)) {
         if (shouldAttemptWellKnownIndex(source)) {
-            installSkillsFromWellKnownIndex(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
+            if (installSkillsFromWellKnownIndex(allocator, source, workspace_dir, detail_out)) {
+                return;
+            } else |err| {
+                switch (err) {
+                    error.ManifestNotFound => {},
+                    else => return err,
+                }
+            }
+        }
+        if (installSkillFromWellKnownUrl(allocator, source, workspace_dir, detail_out)) {
+            return;
+        } else |err| {
+            switch (err) {
                 error.ManifestNotFound => {},
                 else => return err,
-            };
+            }
         }
-        installSkillFromWellKnownUrl(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
-            error.ManifestNotFound => {},
-            else => return err,
-        };
     }
     if (isGitSource(source)) {
         return installSkillFromGit(allocator, source, workspace_dir, detail_out);
@@ -3383,6 +3415,24 @@ test "isGitSource rejects local paths and invalid inputs" {
     }
 }
 
+test "isGitSource rejects HTTPS web skill endpoints" {
+    const sources = [_][]const u8{
+        "https://example.com/.well-known/nullclaw-skill.json",
+        "https://example.com/.well-known/skills/default/skill.md",
+        "https://example.com/skill.md",
+        "https://example.com/.well-known/agent-skills",
+        "https://example.com/.well-known/agent-skills/index.json",
+        "https://example.com/.well-known/agent-skills/code-review",
+        "https://example.com/.well-known/agent-skills/code-review/SKILL.md",
+        "https://example.com/.well-known/agent-skills/code-review.zip",
+        "https://example.com/.well-known/agent-skills/code-review.tar.gz",
+    };
+
+    for (sources) |source| {
+        try std.testing.expect(!isGitSource(source));
+    }
+}
+
 test "source scheme helpers distinguish https from insecure http" {
     try std.testing.expect(isHttpsSource("https://example.com"));
     try std.testing.expect(!isHttpsSource("http://example.com/docs"));
@@ -3539,6 +3589,21 @@ test "verifyWebSkillDigest accepts matching bytes and rejects mismatches" {
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         ),
     );
+}
+
+test "isSafeArchiveRelativePath allows directory entries but rejects traversal" {
+    try std.testing.expect(isSafeArchiveRelativePath("SKILL.md", .file));
+    try std.testing.expect(isSafeArchiveRelativePath("references/FORM.md", .file));
+    try std.testing.expect(isSafeArchiveRelativePath("references/", .directory));
+    try std.testing.expect(isSafeArchiveRelativePath("assets/templates/", .directory));
+
+    try std.testing.expect(!isSafeArchiveRelativePath("references/", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("../SKILL.md", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("references/../SKILL.md", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("/SKILL.md", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("references\\SKILL.md", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("references//SKILL.md", .file));
+    try std.testing.expect(!isSafeArchiveRelativePath("references//", .directory));
 }
 
 const test_zip_skill_archive = [_]u8{
