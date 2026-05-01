@@ -1897,7 +1897,7 @@ pub const SessionManager = struct {
         }
     };
 
-    /// Return the routing input for a session without acquiring session.mutex.
+    /// Return the routing input for a session without acquiring the long turn mutex.
     /// If the session does not exist yet, returns defaults (process, off, false).
     pub fn routeInput(self: *SessionManager, session_key: []const u8) inbound_router.RouteInput {
         self.mutex.lock();
@@ -3965,6 +3965,54 @@ test "processMessage returns mock response" {
     const resp = try sm.processMessage("user:1", "hi", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("Hello from mock", resp);
+}
+
+test "routeInput reports pending mid-turn injection" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "inject:route";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(inbound_router.RoutingDecision.inject, inbound_router.route(sm.routeInput(session_key)));
+
+    // Regression: shells rely on has_pending_injection to replace latest-mode
+    // input instead of accumulating stale pending messages.
+    try sm.injectMidTurn(session_key, "first pending");
+    try testing.expectEqual(inbound_router.RoutingDecision.replace_injection, inbound_router.route(sm.routeInput(session_key)));
+}
+
+test "processMessageStreaming drains pending mid-turn injection into turn history" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "inject:drain";
+    _ = try sm.getOrCreate(session_key);
+    try sm.injectMidTurn(session_key, "mid-turn note");
+
+    const resp = try sm.processMessageStreaming(session_key, "hello", null, null, null);
+    defer testing.allocator.free(resp);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(!sm.routeInput(session_key).has_pending_injection);
+    var saw_initial = false;
+    var saw_injected = false;
+    for (session.agent.history.items) |entry| {
+        if (entry.role != .user) continue;
+        if (std.mem.eql(u8, entry.content, "hello")) saw_initial = true;
+        if (std.mem.eql(u8, entry.content, "mid-turn note")) saw_injected = true;
+    }
+    // Regression: pending injections must be owned by the agent history after
+    // drain so Session.deinit has no stale buffer and the next turn cannot see it.
+    try testing.expect(saw_initial);
+    try testing.expect(saw_injected);
 }
 
 test "processMessageStreaming forwards provider deltas" {

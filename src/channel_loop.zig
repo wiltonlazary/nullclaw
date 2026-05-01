@@ -2271,7 +2271,7 @@ pub fn runMatrixLoop(
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
-                .delivery_chat_id = typing_target,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
