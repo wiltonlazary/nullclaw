@@ -977,7 +977,7 @@ fn processTelegramMessage(
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
-    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
@@ -2409,7 +2409,7 @@ pub fn runMaxLoop(
             };
             const sink = mx_ptr.makeSink(&stream_ctx);
 
-            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
