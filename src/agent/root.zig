@@ -951,6 +951,51 @@ pub const Agent = struct {
         return false;
     }
 
+    fn isToolTriggerSeparator(self: *const Agent, c: u8) bool {
+        return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, self.tools_config.trigger_punctuation, c) != null;
+    }
+
+    fn nextToolTriggerWord(self: *const Agent, text: []const u8, idx: *usize) ?[]const u8 {
+        while (idx.* < text.len and self.isToolTriggerSeparator(text[idx.*])) : (idx.* += 1) {}
+        if (idx.* >= text.len) return null;
+
+        const start = idx.*;
+        while (idx.* < text.len and !self.isToolTriggerSeparator(text[idx.*])) : (idx.* += 1) {}
+        return text[start..idx.*];
+    }
+
+    fn isToolTriggerModifier(self: *const Agent, word: []const u8) bool {
+        for (self.tools_config.trigger_modifiers) |modifier| {
+            if (std.ascii.eqlIgnoreCase(word, modifier)) return true;
+        }
+        return false;
+    }
+
+    fn nextUserToolTriggerWord(self: *const Agent, text: []const u8, idx: *usize) ?[]const u8 {
+        while (self.nextToolTriggerWord(text, idx)) |word| {
+            if (!self.isToolTriggerModifier(word)) return word;
+        }
+        return null;
+    }
+
+    fn normalizedToolTriggerEquals(self: *const Agent, user_message: []const u8, trigger: []const u8) bool {
+        var user_idx: usize = 0;
+        var trigger_idx: usize = 0;
+
+        while (self.nextToolTriggerWord(trigger, &trigger_idx)) |trigger_word| {
+            const user_word = self.nextUserToolTriggerWord(user_message, &user_idx) orelse return false;
+            if (!std.ascii.eqlIgnoreCase(user_word, trigger_word)) return false;
+        }
+
+        return self.nextUserToolTriggerWord(user_message, &user_idx) == null;
+    }
+
+    fn toolTriggerMatchesMessage(self: *const Agent, user_message: []const u8, trigger: []const u8) bool {
+        if (containsAsciiIgnoreCase(user_message, trigger)) return true;
+        if (self.tools_config.trigger_modifiers.len == 0 and self.tools_config.trigger_punctuation.len == 0) return false;
+        return self.normalizedToolTriggerEquals(user_message, trigger);
+    }
+
     fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
         for (self.model_routes) |route| {
             if (std.mem.eql(u8, route.hint, hint)) return true;
@@ -1564,7 +1609,7 @@ pub const Agent = struct {
             if (!std.mem.eql(u8, custom.name, tool_name)) continue;
 
             for (custom.triggers) |kw| {
-                if (!containsAsciiIgnoreCase(user_message, kw)) continue;
+                if (!self.toolTriggerMatchesMessage(user_message, kw)) continue;
                 const score = @as(u16, custom.priority) + 1;
                 if (score > best_score) best_score = score;
                 break;
@@ -9944,6 +9989,34 @@ test "filterToolSpecsForTurn prioritizes triggered custom tools" {
     try std.testing.expectEqualStrings("file_read", result[0].name);
     try std.testing.expectEqualStrings("calculator", result[1].name);
     try std.testing.expectEqualStrings("shell", result[2].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn applies trigger modifiers and punctuation" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "file_read", .description = "read files", .parameters_json = "{}" },
+    };
+    agent.tools_config = .{
+        .trigger_modifiers = &.{ "please", "now" },
+        .trigger_punctuation = "-!",
+        .tool_customizations = &.{
+            .{ .name = "file_read", .triggers = &.{"read file"}, .priority = 5 },
+        },
+    };
+
+    const result = try agent.filterToolSpecsForTurn(arena, "please read-file now!");
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("file_read", result[0].name);
+    try std.testing.expectEqualStrings("shell", result[1].name);
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
 }
 

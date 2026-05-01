@@ -84,7 +84,6 @@ pub const SchedulerConfig = config_types.SchedulerConfig;
 pub const AgentConfig = config_types.AgentConfig;
 pub const ToolFilterGroup = config_types.ToolFilterGroup;
 pub const ToolFilterGroupMode = config_types.ToolFilterGroupMode;
-pub const ToolCustomization = config_types.ToolCustomization;
 pub const ModelRouteConfig = config_types.ModelRouteConfig;
 pub const HeartbeatConfig = config_types.HeartbeatConfig;
 pub const CronConfig = config_types.CronConfig;
