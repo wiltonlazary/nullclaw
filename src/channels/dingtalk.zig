@@ -719,9 +719,9 @@ pub const DingTalkChannel = struct {
     }
 
     fn postJson(self: *DingTalkChannel, webhook_url: []const u8, body: []const u8) !void {
-        var client = std.http.Client{ .allocator = self.allocator, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(self.allocator);
         defer client.deinit();
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = webhook_url },
             .method = .POST,
             .payload = body,

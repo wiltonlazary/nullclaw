@@ -259,7 +259,11 @@ pub fn buildManifestJson(
     }
     try w.writeAll("\n  ],\n");
 
-    try w.writeAll("  \"tools\": {\n");
+    try w.writeAll("  \"tools\": ");
+    try appendJsonStringArray(w, runtime_loaded_names);
+    try w.writeAll(",\n");
+
+    try w.writeAll("  \"tools_detail\": {\n");
     try w.writeAll("    \"runtime_loaded\": ");
     try appendJsonStringArray(w, runtime_loaded_names);
     try w.writeAll(",\n");
@@ -429,7 +433,8 @@ test "buildManifestJson emits core sections" {
 
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"channels\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"memory_engines\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools\": [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"tools_detail\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_append\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_read_hashed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_edit_hashed\"") != null);

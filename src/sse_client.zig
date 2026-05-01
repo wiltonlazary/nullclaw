@@ -10,6 +10,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const http_util = @import("http_util.zig");
 const log = std.log.scoped(.sse_client);
 
 /// Maximum SSE event size (256KB)
@@ -27,7 +28,7 @@ const READ_TIMEOUT_MS: i32 = 1000;
 /// SSE connection that maintains a persistent HTTP connection for streaming
 pub const SseConnection = struct {
     allocator: std.mem.Allocator,
-    client: std.http.Client,
+    client: http_util.ProxyHttpClient,
     request: ?std.http.Client.Request,
     /// The body reader for streaming response data
     body_reader: ?*std.Io.Reader,
@@ -46,10 +47,10 @@ pub const SseConnection = struct {
     };
 
     /// Initialize a new SSE connection (not yet connected)
-    pub fn init(allocator: std.mem.Allocator, url: []const u8) SseConnection {
+    pub fn init(allocator: std.mem.Allocator, url: []const u8) !SseConnection {
         return .{
             .allocator = allocator,
-            .client = std.http.Client{ .allocator = allocator, .io = std_compat.io() },
+            .client = try http_util.ProxyHttpClient.init(allocator),
             .request = null,
             .body_reader = null,
             .url = url,
@@ -104,7 +105,7 @@ pub const SseConnection = struct {
             self.request = null;
         }
 
-        self.request = try self.client.request(.GET, uri, options);
+        self.request = try self.client.client.request(.GET, uri, options);
         const req = &self.request.?;
         errdefer {
             req.deinit();

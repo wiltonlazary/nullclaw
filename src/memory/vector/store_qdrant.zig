@@ -7,6 +7,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
+const http_util = @import("../../http_util.zig");
 const store_mod = @import("store.zig");
 const VectorStore = store_mod.VectorStore;
 const VectorResult = store_mod.VectorResult;
@@ -116,7 +117,7 @@ pub const QdrantVectorStore = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !struct { status: std.http.Status, body: []u8 } {
-        var client = std.http.Client{ .allocator = alloc, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(alloc);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -133,7 +134,7 @@ pub const QdrantVectorStore = struct {
             header_count += 1;
         }
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = method,
             .payload = payload,
@@ -393,13 +394,13 @@ pub const QdrantVectorStore = struct {
         const url = try std.fmt.allocPrint(alloc, "{s}/healthz", .{self.url});
         defer alloc.free(url);
 
-        var client = std.http.Client{ .allocator = alloc, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(alloc);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
             .response_writer = &aw.writer,

@@ -135,7 +135,6 @@ pub const ApiMemory = struct {
         method: std.http.Method,
         payload: ?[]const u8,
     ) !HttpResponse {
-        // Zig 0.15 std.http fetch has no request timeout control.
         // Use curl subprocess so `timeout_ms` is guaranteed to apply.
         const timeout_secs: u32 = @max(@as(u32, 1), (self.timeout_ms + 999) / 1000);
         var timeout_buf: [16]u8 = undefined;

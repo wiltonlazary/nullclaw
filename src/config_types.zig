@@ -360,6 +360,23 @@ pub const AgentConfig = struct {
     }
 };
 
+pub const ToolCustomization = struct {
+    /// Tool name (e.g., "screenshot", "file_read", "shell")
+    name: []const u8,
+    /// Custom system prompt for this tool.
+    /// If provided, this will override the default tool description.
+    system_prompt: ?[]const u8 = null,
+    /// Trigger keywords for this tool.
+    /// When user message contains any of these keywords,
+    /// the tool will be prioritized.
+    triggers: []const []const u8 = &.{},
+    /// Priority level (higher = more important).
+    /// Default is 0.
+    priority: u8 = 0,
+    /// Whether this tool is enabled.
+    enabled: bool = true,
+};
+
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
@@ -373,6 +390,15 @@ pub const ToolsConfig = struct {
     ///
     /// Example: ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"]
     path_env_vars: []const []const u8 = &.{},
+    /// Tool customization configuration.
+    /// Allows customizing system prompts, trigger keywords, and priorities for individual tools.
+    tool_customizations: []const ToolCustomization = &.{},
+    /// Optional path to external JSON file containing tool customizations.
+    tool_customizations_file: ?[]const u8 = null,
+    /// Custom modifiers to remove from user input when checking for exact trigger matches.
+    trigger_modifiers: []const []const u8 = &.{},
+    /// Custom punctuation characters to remove when checking for exact trigger matches.
+    trigger_punctuation: []const u8 = "",
 };
 
 pub const ModelRouteCostClass = enum {
@@ -400,6 +426,17 @@ pub const ModelRouteConfig = struct {
 pub const HeartbeatConfig = struct {
     enabled: bool = false,
     interval_minutes: u32 = 30,
+    prompt: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    timeout_secs: u32 = 120,
+    delivery_mode: ?[]const u8 = null,
+    delivery_channel: ?[]const u8 = null,
+    delivery_to: ?[]const u8 = null,
+    delivery_account_id: ?[]const u8 = null,
+    delivery_peer_kind: ?[]const u8 = null,
+    delivery_peer_id: ?[]const u8 = null,
+    delivery_thread_id: ?[]const u8 = null,
+    delivery_best_effort: bool = true,
 };
 
 pub const CronConfig = struct {
@@ -563,6 +600,11 @@ pub const MatrixConfig = struct {
     dm_policy: []const u8 = "allowlist",
     group_policy: []const u8 = "allowlist",
     require_mention: bool = false,
+    /// Optional pantalaimon E2EE proxy URL (e.g. "http://localhost:8008").
+    /// When set, all Matrix API requests are routed through the proxy instead
+    /// of directly to the homeserver. The homeserver field is still required
+    /// for display and onboarding purposes.
+    pantalaimon_proxy_url: ?[]const u8 = null,
 };
 
 pub const MattermostConfig = struct {
@@ -653,6 +695,17 @@ pub const WeComConfig = struct {
     encoding_aes_key: ?[]const u8 = null,
     /// Expected receiver ID (typically CorpID) for decrypted callback validation.
     corp_id: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+};
+
+pub const WeixinConfig = struct {
+    account_id: []const u8 = "default",
+    /// Bot token obtained from iLink QR code login flow.
+    token: []const u8 = "",
+    /// iLink API base URL (may be region-specific after login redirect).
+    base_url: []const u8 = "https://ilinkai.weixin.qq.com/",
+    /// Optional HTTP proxy URL for API requests.
+    proxy: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
 };
 
@@ -995,6 +1048,7 @@ pub const ChannelsConfig = struct {
     dingtalk: []const DingTalkConfig = &.{},
     wechat: []const WeChatConfig = &.{},
     wecom: []const WeComConfig = &.{},
+    weixin: []const WeixinConfig = &.{},
     signal: []const SignalConfig = &.{},
     email: []const EmailConfig = &.{},
     line: []const LineConfig = &.{},
@@ -1062,6 +1116,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn wecomPrimary(self: *const ChannelsConfig) ?WeComConfig {
         return primaryAccount(WeComConfig, self.wecom);
+    }
+    pub fn weixinPrimary(self: *const ChannelsConfig) ?WeixinConfig {
+        return primaryAccount(WeixinConfig, self.weixin);
     }
     pub fn emailPrimary(self: *const ChannelsConfig) ?EmailConfig {
         return primaryAccount(EmailConfig, self.email);
@@ -1498,8 +1555,9 @@ pub const HttpRequestConfig = struct {
     /// Allowed forms:
     ///   - https://host
     ///   - https://host/search
-    ///   - http://localhost[:port]
-    ///   - http://localhost[:port]/search
+    ///   - http://localhost[:port][/search]
+    ///   - http://192.168.1.10[:port][/search]
+    ///   - http://searx.local[:port][/search]
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
         return search_base_url.isValid(raw);
     }

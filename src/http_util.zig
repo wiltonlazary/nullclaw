@@ -1,7 +1,7 @@
 //! Shared HTTP utilities via curl subprocess.
 //!
 //! Replaces 9+ local `curlPost` / `curlGet` duplicates across the codebase.
-//! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
+//! Uses curl to keep timeout handling explicit and avoid std.http regressions.
 
 const std = @import("std");
 const std_compat = @import("compat");
@@ -24,7 +24,7 @@ fn classifyCurlExitCode(code: u8) []const u8 {
     };
 }
 
-fn mapCurlExitCodeToError(code: u8) anyerror {
+pub fn mapCurlExitCodeToError(code: u8) anyerror {
     return switch (code) {
         6 => error.CurlDnsError,
         7 => error.CurlConnectError,
@@ -75,6 +75,53 @@ pub const HttpResponseWithHeaders = struct {
     status_code: u16,
     headers: []u8,
     body: []u8,
+};
+
+const proxy_env_var_names = [_][]const u8{
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+};
+const http_proxy_env_var_names = [_][]const u8{
+    "http_proxy",
+    "HTTP_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+};
+const https_proxy_env_var_names = [_][]const u8{
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+};
+
+pub const ProxyHttpClient = struct {
+    proxy_arena: std.heap.ArenaAllocator,
+    client: std.http.Client,
+
+    pub fn init(allocator: Allocator) !ProxyHttpClient {
+        var proxy_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer proxy_arena.deinit();
+
+        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+        errdefer client.deinit();
+
+        try initClientDefaultProxies(&client, proxy_arena.allocator());
+
+        return .{
+            .proxy_arena = proxy_arena,
+            .client = client,
+        };
+    }
+
+    pub fn deinit(self: *ProxyHttpClient) void {
+        self.client.deinit();
+        self.proxy_arena.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const SafeResolveEntryError = Allocator.Error || error{
@@ -909,7 +956,8 @@ pub fn curlGetMaxBytes(
 }
 
 /// Read proxy URL from standard environment variables.
-/// Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY in that order.
+/// Checks https_proxy/HTTPS_PROXY first, then http_proxy/HTTP_PROXY,
+/// then all_proxy/ALL_PROXY.
 /// Returns null if no proxy is set.
 /// Caller owns returned memory.
 var proxy_override_value: ?[]u8 = null;
@@ -941,25 +989,79 @@ fn normalizeProxyEnvValue(allocator: Allocator, val: []const u8) !?[]const u8 {
     return try allocator.dupe(u8, trimmed);
 }
 
-pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
-    {
-        proxy_override_mutex.lock();
-        defer proxy_override_mutex.unlock();
-        if (proxy_override_value) |override| {
-            return try allocator.dupe(u8, override);
+fn applyProxyOverrideToEnvMap(env_map: *std_compat.process.EnvMap) !bool {
+    proxy_override_mutex.lock();
+    defer proxy_override_mutex.unlock();
+
+    const override = proxy_override_value orelse return false;
+    for (proxy_env_var_names) |key| {
+        try env_map.put(key, override);
+    }
+    return true;
+}
+
+fn putProxyEnvVarFromProcess(
+    env_map: *std_compat.process.EnvMap,
+    allocator: Allocator,
+    key: []const u8,
+) !void {
+    if (std_compat.process.getEnvVarOwned(allocator, key)) |raw_value| {
+        defer allocator.free(raw_value);
+        if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            try env_map.put(key, proxy);
+        }
+    } else |_| {}
+}
+
+fn buildProxyEnvMapFromProcess(allocator: Allocator) !std_compat.process.EnvMap {
+    var env_map = std_compat.process.EnvMap.init(allocator);
+    errdefer env_map.deinit();
+
+    for (proxy_env_var_names) |key| {
+        try putProxyEnvVarFromProcess(&env_map, allocator, key);
+    }
+    _ = try applyProxyOverrideToEnvMap(&env_map);
+
+    return env_map;
+}
+
+fn getProxyFromEnvMap(
+    allocator: Allocator,
+    env_map: *const std_compat.process.EnvMap,
+    env_vars: []const []const u8,
+) !?[]const u8 {
+    for (env_vars) |var_name| {
+        const raw_value = env_map.get(var_name) orelse continue;
+        if (try normalizeProxyEnvValue(allocator, raw_value)) |proxy| {
+            return proxy;
         }
     }
-
-    const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
-    for (env_vars) |var_name| {
-        if (std_compat.process.getEnvVarOwned(allocator, var_name)) |val| {
-            errdefer allocator.free(val);
-            const out = try normalizeProxyEnvValue(allocator, val);
-            allocator.free(val);
-            if (out) |proxy| return proxy;
-        } else |_| {}
-    }
     return null;
+}
+
+fn initClientDefaultProxiesFromEnvMap(
+    client: *std.http.Client,
+    arena: Allocator,
+    env_map: *const std_compat.process.EnvMap,
+) !void {
+    var merged_env_map = try env_map.clone(arena);
+    _ = try applyProxyOverrideToEnvMap(&merged_env_map);
+    try client.initDefaultProxies(arena, &merged_env_map);
+}
+
+pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !void {
+    var env_map = try buildProxyEnvMapFromProcess(arena);
+    try client.initDefaultProxies(arena, &env_map);
+}
+
+pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
+    var env_map = try buildProxyEnvMapFromProcess(allocator);
+    defer env_map.deinit();
+
+    if (try getProxyFromEnvMap(allocator, &env_map, &https_proxy_env_var_names)) |proxy| {
+        return proxy;
+    }
+    return try getProxyFromEnvMap(allocator, &env_map, &http_proxy_env_var_names);
 }
 
 /// HTTP GET via curl for SSE (Server-Sent Events).
@@ -1189,4 +1291,55 @@ test "setProxyOverride accepts long proxy URLs" {
     defer if (from_override) |v| allocator.free(v);
     try std.testing.expect(from_override != null);
     try std.testing.expectEqual(long_proxy.len, from_override.?.len);
+}
+
+test "getProxyFromEnvMap honors lowercase https_proxy before http_proxy" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("http_proxy", "http://http-only.example:8080");
+    try env_map.put("https_proxy", "https://secure.example:8443");
+
+    const proxy = try getProxyFromEnvMap(std.testing.allocator, &env_map, &https_proxy_env_var_names);
+    defer if (proxy) |value| std.testing.allocator.free(value);
+
+    try std.testing.expect(proxy != null);
+    try std.testing.expectEqualStrings("https://secure.example:8443", proxy.?);
+}
+
+test "applyProxyOverrideToEnvMap overwrites existing proxy values" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("HTTPS_PROXY", "https://old.example:9443");
+    try setProxyOverride("  socks5://override.example:1080  ");
+    defer setProxyOverride(null) catch unreachable;
+
+    try std.testing.expect(try applyProxyOverrideToEnvMap(&env_map));
+    try std.testing.expectEqualStrings("socks5://override.example:1080", env_map.get("HTTPS_PROXY").?);
+    try std.testing.expectEqualStrings("socks5://override.example:1080", env_map.get("http_proxy").?);
+}
+
+test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
+    var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+    defer env_map.deinit();
+
+    try env_map.put("http_proxy", "http://proxy-http.example:8080");
+    try env_map.put("HTTPS_PROXY", "https://proxy-https.example:8443");
+
+    var proxy_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer proxy_arena.deinit();
+
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+
+    // Regression: Zig 0.16 requires an explicit environ map for initDefaultProxies.
+    try initClientDefaultProxiesFromEnvMap(&client, proxy_arena.allocator(), &env_map);
+
+    try std.testing.expect(client.http_proxy != null);
+    try std.testing.expect(client.https_proxy != null);
+    try std.testing.expectEqual(@as(u16, 8080), client.http_proxy.?.port);
+    try std.testing.expectEqual(@as(u16, 8443), client.https_proxy.?.port);
+    try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
+    try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
 }

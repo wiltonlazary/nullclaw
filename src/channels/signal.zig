@@ -1221,7 +1221,12 @@ pub const SignalChannel = struct {
             var url_buf: [1024]u8 = undefined;
             const url = try self.sseUrl(&url_buf);
 
-            self.sse_conn = sse_client.SseConnection.init(self.allocator, url);
+            self.sse_conn = sse_client.SseConnection.init(self.allocator, url) catch |err| {
+                log.warn("SSE init failed: {}, retrying in {}s", .{ err, self.sse_retry_delay_secs });
+                self.sse_next_retry_at = now + @as(i64, @intCast(self.sse_retry_delay_secs));
+                self.sse_retry_delay_secs = @min(self.sse_retry_delay_secs * 2, 60);
+                return &.{};
+            };
             const status = self.sse_conn.?.connect() catch |err| {
                 log.warn("SSE connect failed: {}, retrying in {}s", .{ err, self.sse_retry_delay_secs });
                 if (self.sse_conn) |*conn| {

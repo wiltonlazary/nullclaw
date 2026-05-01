@@ -73,6 +73,9 @@ pub const ChannelMessage = struct {
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
     is_group: bool = false,
+    /// True when the inbound event originated from an interaction callback
+    /// (for example, a Telegram inline keyboard button press).
+    is_interaction_callback: bool = false,
     /// Sender UUID (Signal-specific: when user has privacy mode enabled).
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
@@ -291,6 +294,7 @@ pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
 pub const wechat = @import("wechat.zig");
 pub const wecom = @import("wecom.zig");
+pub const weixin = @import("weixin.zig");
 pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
@@ -504,7 +508,7 @@ pub fn nowEpochSecs() u64 {
 // Shared Utilities (re-exported from top-level modules)
 // ════════════════════════════════════════════════════════════════════════════
 
-/// HTTP POST via curl subprocess (safe on Zig 0.15, avoids std.http.Client segfaults).
+/// HTTP POST via curl subprocess with explicit timeout/error semantics.
 pub const http_util = @import("../http_util.zig");
 
 /// JSON string escaping (RFC 8259). appendJsonString adds enclosing quotes.

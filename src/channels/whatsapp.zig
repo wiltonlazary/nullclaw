@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
+const http_util = @import("../http_util.zig");
 
 /// WhatsApp channel — uses WhatsApp Business Cloud API.
 /// Operates in webhook mode (push-based); messages received via gateway endpoint.
@@ -286,10 +287,10 @@ pub const WhatsAppChannel = struct {
         try auth_writer.print("Bearer {s}", .{self.access_token});
         const auth_value = auth_writer.buffered();
 
-        var client = std.http.Client{ .allocator = self.allocator, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(self.allocator);
         defer client.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,

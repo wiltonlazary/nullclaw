@@ -9,6 +9,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
+const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 
 // ── PKCE (RFC 7636) ────────────────────────────────────────────────────
@@ -367,7 +368,7 @@ pub fn refreshAccessToken(
     client_id: []const u8,
     refresh_token: []const u8,
 ) !OAuthToken {
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -379,7 +380,7 @@ pub fn refreshAccessToken(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = token_url },
         .method = .POST,
         .payload = payload,
@@ -493,7 +494,7 @@ pub fn startDeviceCodeFlow(
     device_auth_url: []const u8,
     scope: []const u8,
 ) !DeviceCode {
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -505,7 +506,7 @@ pub fn startDeviceCodeFlow(
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = device_auth_url },
         .method = .POST,
         .payload = payload,
@@ -580,7 +581,7 @@ pub fn pollDeviceCode(
     device_code: []const u8,
     interval_s: u32,
 ) !OAuthToken {
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -598,7 +599,7 @@ pub fn pollDeviceCode(
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = token_url },
             .method = .POST,
             .payload = payload,

@@ -338,18 +338,46 @@ fn validateCandidateJson(allocator: std.mem.Allocator, config_path: []const u8, 
     try cfg.validate();
 }
 
-pub fn getPathValueJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+pub fn validateProposedConfigJson(allocator: std.mem.Allocator, content: []const u8) !void {
     const config_path = try defaultConfigPath(allocator);
     defer allocator.free(config_path);
 
-    const data = try readConfigOrDefault(allocator, config_path);
-    defer allocator.free(data.content);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try validateCandidateJson(arena.allocator(), config_path, content);
+}
+
+pub fn getCurrentConfigJson(allocator: std.mem.Allocator) ![]u8 {
+    const config_path = try defaultConfigPath(allocator);
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    defer file.close();
+
+    return try file.readToEndAlloc(allocator, 1024 * 1024);
+}
+
+pub fn findPathValueJson(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const config_path = try defaultConfigPath(allocator);
+    defer allocator.free(config_path);
+
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.FileNotFound,
+        else => return err,
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(data);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const parsed = std.json.parseFromSlice(std.json.Value, a, data.content, .{}) catch return error.InvalidJson;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, data, .{}) catch return error.InvalidJson;
 
     var root = parsed.value;
     if (root != .object) {
@@ -357,7 +385,13 @@ pub fn getPathValueJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 
     const tokens = try splitPathTokens(a, path);
-    return stringifyPathValueJson(allocator, &root, path, tokens);
+    if (valueAtPath(&root, tokens) == null) return null;
+    return try stringifyPathValueJson(allocator, &root, path, tokens);
+}
+
+pub fn getPathValueJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (try findPathValueJson(allocator, path)) |value_json| return value_json;
+    return try allocator.dupe(u8, "null");
 }
 
 pub fn validateCurrentConfig(allocator: std.mem.Allocator) !void {

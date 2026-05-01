@@ -7,6 +7,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
+const http_util = @import("../../http_util.zig");
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const net_security = @import("../../net_security.zig");
 
@@ -107,13 +108,13 @@ pub const OllamaEmbedding = struct {
         const url = try self_.buildUrl(allocator);
         defer allocator.free(url);
 
-        var client = std.http.Client{ .allocator = allocator, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(allocator);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body,

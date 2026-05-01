@@ -17,6 +17,10 @@ const daemon = @import("daemon.zig");
 const cron = @import("cron.zig");
 const fs_compat = @import("fs_compat.zig");
 const builtin = @import("builtin");
+const health = @import("health.zig");
+const json_util = @import("json_util.zig");
+const admin_output = @import("admin_output.zig");
+const version = @import("version.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 const memory_root = @import("memory/root.zig");
@@ -26,6 +30,9 @@ const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
 const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
+const NON_CLI_CHANNEL_CONFIGURED_MESSAGE = "at least one non-CLI channel configured";
+const NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE = "no non-CLI channels configured -- run `nullclaw onboard` to set one up";
+const CLI_ALWAYS_AVAILABLE_MESSAGE = "CLI always available";
 // ── ANSI color support ──────────────────────────────────────────
 
 extern "kernel32" fn GetStdHandle(nStdHandle: std.os.windows.DWORD) callconv(.winapi) ?std.os.windows.HANDLE;
@@ -120,6 +127,192 @@ pub const DiagResult = struct {
     ok: bool,
     message: []const u8,
 };
+
+fn appendNullableString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: ?[]const u8) !void {
+    if (value) |text| {
+        try json_util.appendJsonString(buf, allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn appendNullablePid(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: ?u32) !void {
+    if (value) |pid| {
+        var int_buf: [24]u8 = undefined;
+        const text = try std.fmt.bufPrint(&int_buf, "{d}", .{pid});
+        try buf.appendSlice(allocator, text);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+}
+
+fn overallStatus(components: []const health.SnapshotComponent) []const u8 {
+    var saw_starting = false;
+    for (components) |entry| {
+        if (std.mem.eql(u8, entry.health.status, "error")) return "error";
+        if (!std.mem.eql(u8, entry.health.status, "ok")) saw_starting = true;
+    }
+    return if (saw_starting) "starting" else "ok";
+}
+
+fn appendComponentJson(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    component: health.ComponentHealth,
+) !void {
+    try json_util.appendJsonKey(buf, allocator, name);
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(buf, allocator, "status", component.status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(buf, allocator, "updated_at", component.updated_at[0..component.updated_at_len]);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_ok");
+    if (component.last_ok) |last_ok| {
+        try json_util.appendJsonString(buf, allocator, last_ok[0..component.last_ok_len]);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "last_error");
+    try appendNullableString(buf, allocator, component.last_error);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(buf, allocator, "restart_count", @intCast(component.restart_count));
+    try buf.appendSlice(allocator, "}");
+}
+
+pub fn buildDoctorJson(allocator: std.mem.Allocator) ![]u8 {
+    var snapshot = try health.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    std.mem.sort(health.SnapshotComponent, snapshot.components, {}, struct {
+        fn lessThan(_: void, lhs: health.SnapshotComponent, rhs: health.SnapshotComponent) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+        }
+    }.lessThan);
+
+    const ready = blk: {
+        for (snapshot.components) |entry| {
+            if (!std.mem.eql(u8, entry.health.status, "ok")) break :blk false;
+        }
+        break :blk true;
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "version", version.string);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "pid");
+    try appendNullablePid(&buf, allocator, snapshot.pid);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "uptime_seconds", @intCast(snapshot.uptime_seconds));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "overall_status", overallStatus(snapshot.components));
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "ready");
+    try buf.appendSlice(allocator, if (ready) "true" else "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "components");
+    try buf.appendSlice(allocator, "{");
+    for (snapshot.components, 0..) |entry, idx| {
+        if (idx > 0) try buf.appendSlice(allocator, ",");
+        try appendComponentJson(&buf, allocator, entry.name, entry.health);
+    }
+    try buf.appendSlice(allocator, "}}");
+
+    return try buf.toOwnedSlice(allocator);
+}
+
+const GatewayDoctorFetch = enum {
+    printed,
+    unavailable,
+    unauthorized,
+    failed,
+};
+
+fn printStdoutBytes(text: []const u8) void {
+    admin_output.writeStdoutBytes(text) catch return;
+}
+
+fn printGatewayDoctorJson(allocator: std.mem.Allocator) GatewayDoctorFetch {
+    switch (cron.requestGatewayGet(allocator, "/doctor")) {
+        .unavailable => return .unavailable,
+        .response => |resp| {
+            defer allocator.free(resp.body);
+            if (resp.status_code >= 200 and resp.status_code < 300) {
+                printStdoutBytes(resp.body);
+                if (resp.body.len == 0 or resp.body[resp.body.len - 1] != '\n') {
+                    printStdoutBytes("\n");
+                }
+                return .printed;
+            }
+            if (resp.status_code == 401 or resp.status_code == 403) return .unauthorized;
+            return .failed;
+        },
+    }
+}
+
+fn buildFallbackDoctorJson(
+    allocator: std.mem.Allocator,
+    overall_status: []const u8,
+    message: ?[]const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{");
+    try json_util.appendJsonKeyValue(&buf, allocator, "version", version.string);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "pid");
+    try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonInt(&buf, allocator, "uptime_seconds", 0);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKeyValue(&buf, allocator, "overall_status", overall_status);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "ready");
+    try buf.appendSlice(allocator, "false");
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(&buf, allocator, "components");
+    try buf.appendSlice(allocator, "{}");
+    if (message) |msg| {
+        try buf.appendSlice(allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, allocator, "message", msg);
+    }
+    try buf.appendSlice(allocator, "}");
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn printFallbackDoctorJson(allocator: std.mem.Allocator, fetch: GatewayDoctorFetch) !void {
+    const doctor_json = try buildFallbackDoctorJson(
+        allocator,
+        switch (fetch) {
+            .printed => unreachable,
+            .unavailable => "unavailable",
+            .unauthorized => "unauthorized",
+            .failed => "gateway_error",
+        },
+        switch (fetch) {
+            .printed => null,
+            .unavailable => "Gateway unavailable",
+            .unauthorized => "Gateway doctor requires authentication",
+            .failed => "Gateway doctor request failed",
+        },
+    );
+    defer allocator.free(doctor_json);
+
+    printStdoutBytes(doctor_json);
+    printStdoutBytes("\n");
+}
+
+pub fn runJson(allocator: std.mem.Allocator) !void {
+    switch (printGatewayDoctorJson(allocator)) {
+        .printed => return,
+        else => |fetch| try printFallbackDoctorJson(allocator, fetch),
+    }
+}
 
 // ── Public entry point ──────────────────────────────────────────
 
@@ -279,9 +472,9 @@ pub fn checkConfigSemantics(
     const has_channel = channel_catalog.hasAnyConfigured(config, false);
 
     if (has_channel) {
-        try items.append(allocator, DiagItem.ok(cat, "at least one channel configured"));
+        try items.append(allocator, DiagItem.ok(cat, NON_CLI_CHANNEL_CONFIGURED_MESSAGE));
     } else {
-        try items.append(allocator, DiagItem.warn(cat, "no channels configured -- run `nullclaw onboard` to set one up"));
+        try items.append(allocator, DiagItem.warn(cat, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE));
     }
 }
 
@@ -701,7 +894,9 @@ fn checkCronStatus(allocator: std.mem.Allocator, items: *std.ArrayList(DiagItem)
 /// Check channel connectivity.
 fn checkChannels(allocator: std.mem.Allocator, cfg: *const Config, items: *std.ArrayList(DiagItem)) void {
     const cat = "channels";
-    items.append(allocator, DiagItem.ok(cat, "CLI always available")) catch {};
+    if (channel_catalog.isBuildEnabled(.cli)) {
+        items.append(allocator, DiagItem.ok(cat, CLI_ALWAYS_AVAILABLE_MESSAGE)) catch {};
+    }
 
     for (channel_catalog.known_channels) |meta| {
         if (meta.id == .cli) continue;
@@ -825,7 +1020,7 @@ test "checkConfigSemantics warns empty default provider" {
     try std.testing.expect(found_err);
 }
 
-test "checkConfigSemantics warns no channels" {
+test "checkConfigSemantics warns no non-CLI channels" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -836,11 +1031,67 @@ test "checkConfigSemantics warns no channels" {
 
     var found_warn = false;
     for (items.items) |item| {
-        if (std.mem.indexOf(u8, item.message, "no channels") != null and item.severity == .warn) {
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
             found_warn = true;
         }
     }
     try std.testing.expect(found_warn);
+}
+
+test "checkConfigSemantics reports configured non-CLI channel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var items: std.ArrayList(DiagItem) = .empty;
+
+    var cfg = testConfig();
+    cfg.channels.webhook = .{};
+    try checkConfigSemantics(allocator, &cfg, &items);
+
+    var found_ok = false;
+    var found_warn = false;
+    for (items.items) |item| {
+        if (std.mem.eql(u8, item.message, NON_CLI_CHANNEL_CONFIGURED_MESSAGE) and item.severity == .ok) {
+            found_ok = true;
+        }
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
+            found_warn = true;
+        }
+    }
+    try std.testing.expect(found_ok);
+    try std.testing.expect(!found_warn);
+}
+
+test "doctor reports CLI availability separately from non-CLI channel configuration" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = testConfig();
+
+    var config_items: std.ArrayList(DiagItem) = .empty;
+    try checkConfigSemantics(allocator, &cfg, &config_items);
+
+    // Regression: issue #827 showed a contradictory "no channels configured" warning
+    // even though the CLI channel was reported as available elsewhere in doctor output.
+    var found_non_cli_warn = false;
+    for (config_items.items) |item| {
+        if (std.mem.eql(u8, item.message, NO_NON_CLI_CHANNELS_CONFIGURED_MESSAGE) and item.severity == .warn) {
+            found_non_cli_warn = true;
+        }
+    }
+    try std.testing.expect(found_non_cli_warn);
+
+    var channel_items: std.ArrayList(DiagItem) = .empty;
+    checkChannels(allocator, &cfg, &channel_items);
+
+    var found_cli_ok = false;
+    for (channel_items.items) |item| {
+        if (std.mem.eql(u8, item.message, CLI_ALWAYS_AVAILABLE_MESSAGE) and item.severity == .ok) {
+            found_cli_ok = true;
+        }
+    }
+    try std.testing.expectEqual(channel_catalog.isBuildEnabled(.cli), found_cli_ok);
 }
 
 test "parseDfAvailableMb parses output" {
@@ -955,6 +1206,36 @@ test "DiagResult defaults" {
     const result = DiagResult{ .name = "test", .ok = true, .message = "all good" };
     try std.testing.expectEqualStrings("test", result.name);
     try std.testing.expect(result.ok);
+}
+
+test "buildDoctorJson includes ready true for healthy components" {
+    health.reset();
+    defer health.reset();
+
+    health.markComponentOk("gateway");
+    health.markComponentOk("scheduler");
+
+    const json = try buildDoctorJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ready\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"overall_status\":\"ok\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"components\":{\"gateway\":") != null);
+}
+
+test "buildDoctorJson includes ready false when component unhealthy" {
+    health.reset();
+    defer health.reset();
+
+    health.markComponentOk("gateway");
+    health.markComponentError("scheduler", "stalled");
+
+    const json = try buildDoctorJson(std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"overall_status\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"last_error\":\"stalled\"") != null);
 }
 
 // ── Test helper ─────────────────────────────────────────────────

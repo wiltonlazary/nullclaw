@@ -144,7 +144,7 @@ fn findProfileForSessionKey(config: *const Config, session_key: []const u8) ?con
 }
 
 const SessionProviderContext = struct {
-    provider: Provider,
+    provider: ?Provider = null,
     holder: ?providers.ProviderHolder = null,
     owned_api_key: ?[]u8 = null,
 
@@ -1344,7 +1344,7 @@ pub const SessionManager = struct {
         const session_provider = if (session.provider_holder) |*holder|
             holder.provider()
         else
-            provider_ctx.provider;
+            provider_ctx.provider.?;
 
         var agent = try Agent.fromConfigWithProfile(
             self.allocator,
@@ -1431,7 +1431,7 @@ pub const SessionManager = struct {
             break :blk owned_api_key;
         };
 
-        var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        const holder = providers.ProviderHolder.fromConfigWithApiMode(
             self.allocator,
             profile.provider,
             provider_api_key,
@@ -1444,7 +1444,6 @@ pub const SessionManager = struct {
             self.config.getProviderExtraBodyParams(profile.provider),
         );
         return .{
-            .provider = holder.provider(),
             .holder = holder,
             .owned_api_key = owned_api_key,
         };
@@ -1597,10 +1596,52 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
-        return self.processMessageStreaming(session_key, content, conversation_context, null);
+        return self.processMessageStreaming(session_key, content, conversation_context, null, null);
     }
 
-    /// Process a message within a session context and optionally forward text deltas.
+    /// Handle a slash command against the live session without invoking the LLM turn loop.
+    /// Used for transport-driven local UIs such as Telegram callback menus.
+    pub fn handleLocalSlashCommand(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) !?[]const u8 {
+        const session = try self.getOrCreate(session_key);
+
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
+
+        session.agent.conversation_context = conversation_context;
+        defer session.agent.conversation_context = null;
+        setTurnToolContext(session.agent.tools, session_key, conversation_context);
+
+        const maybe_response = try session.agent.handleSlashCommand(content);
+        if (maybe_response == null) return null;
+
+        session.turn_count += 1;
+        session.last_active = std_compat.time.timestamp();
+
+        if (session.agent.session_store) |store| {
+            const turn_input = agent_mod.commands.planTurnInput(content);
+            if (turn_input.clear_session) {
+                store.clearMessages(session_key) catch {};
+                store.clearAutoSaved(session_key) catch {};
+            }
+            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
+                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
+            }
+        }
+
+        return maybe_response;
+    }
+
+    /// Process a message within a session context and optionally forward text deltas and progress hints.
     /// Deltas are only emitted when provider streaming is active.
     pub fn processMessageStreaming(
         self: *SessionManager,
@@ -1608,6 +1649,7 @@ pub const SessionManager = struct {
         content: []const u8,
         conversation_context: ?ConversationContext,
         stream_sink: ?streaming.Sink,
+        progress_sink: ?agent_mod.ProgressSink,
     ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
@@ -1676,6 +1718,20 @@ pub const SessionManager = struct {
         } else {
             session.agent.stream_callback = null;
             session.agent.stream_ctx = null;
+        }
+
+        const prev_progress_callback = session.agent.progress_callback;
+        const prev_progress_ctx = session.agent.progress_ctx;
+        defer {
+            session.agent.progress_callback = prev_progress_callback;
+            session.agent.progress_ctx = prev_progress_ctx;
+        }
+        if (progress_sink) |ps| {
+            session.agent.progress_callback = ps.callback;
+            session.agent.progress_ctx = ps.ctx;
+        } else {
+            session.agent.progress_callback = null;
+            session.agent.progress_ctx = null;
         }
 
         // Record agent start event with channel attribution
@@ -2187,6 +2243,23 @@ const DeltaCollector = struct {
 
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
+    }
+};
+
+const ProgressCollector = struct {
+    count: usize = 0,
+    last_text_buf: [64]u8 = undefined,
+    last_text_len: usize = 0,
+
+    fn onEvent(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+        const self: *ProgressCollector = @ptrCast(@alignCast(ctx_ptr));
+        self.count += 1;
+        self.last_text_len = @min(hint.text.len, self.last_text_buf.len);
+        @memcpy(self.last_text_buf[0..self.last_text_len], hint.text[0..self.last_text_len]);
+    }
+
+    fn lastText(self: *const ProgressCollector) []const u8 {
+        return self.last_text_buf[0..self.last_text_len];
     }
 };
 
@@ -2744,17 +2817,26 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
     cfg.default_provider = "openrouter";
+    cfg.providers = &.{
+        .{
+            .name = "custom:dmr",
+            .base_url = "http://127.0.0.1:8080/v1",
+        },
+    };
     cfg.agents = &.{
         .{
             .name = "Coder Agent",
-            .provider = "ollama",
-            .model = "qwen2.5-coder:14b",
+            .provider = "custom:dmr",
+            .model = "smollm2",
+            .api_key = "placeholder",
         },
     };
 
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
+    // Regression: issue #811 requires holder-backed custom providers to bind
+    // Agent.provider to the session-owned holder rather than transient storage.
     const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
     try testing.expect(session.provider_holder != null);
 
@@ -2762,6 +2844,12 @@ test "getOrCreate stores named agent provider interface from session-owned holde
     const holder_provider = holder.provider();
     try testing.expect(session.agent.provider.ptr == holder_provider.ptr);
     try testing.expect(session.agent.provider.vtable == holder_provider.vtable);
+    switch (session.provider_holder.?) {
+        .compatible => |*compatible_provider| {
+            try testing.expectEqual(@intFromPtr(compatible_provider), @intFromPtr(session.agent.provider.ptr));
+        },
+        else => unreachable,
+    }
 }
 
 test "getOrCreate uses named agent workspace namespace when workspace_path is set" {
@@ -2898,6 +2986,62 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     const session = try sm.getOrCreate("agent:helper-bot:telegram:direct:42");
     try expectPathEndsWith(session.agent.workspace_dir, "agents/helper-workspace");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "handleLocalSlashCommand activates interactive skill session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    try tmp_dir.makePath("skills/news-digest");
+    {
+        const f = try tmp_dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp_dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:group:-100123:thread:7";
+    const response = (try sm.handleLocalSlashCommand(session_key, "/iskill news-digest", .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    })).?;
+    defer testing.allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "Active skill set to `news-digest`") != null);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(session.agent.active_skill_name != null);
+    try testing.expectEqualStrings("news-digest", session.agent.active_skill_name.?);
+    try testing.expect(session.agent.active_skill_interactive);
 }
 
 test "claim gate blocks unverified peer when dm_scope is main" {
@@ -3495,11 +3639,53 @@ test "processMessageStreaming forwards provider deltas" {
             .callback = DeltaCollector.onEvent,
             .ctx = @ptrCast(&collector),
         },
+        null,
     );
     defer testing.allocator.free(resp);
 
     try testing.expectEqualStrings("streaming reply", resp);
     try testing.expectEqualStrings("streaming reply", collector.data.items);
+}
+
+test "processMessageStreaming forwards tool progress hints" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "progress:tool";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    var collector = ProgressCollector{};
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "run probe",
+        null,
+        null,
+        .{
+            .callback = ProgressCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    // Regression: A2A streaming depends on this sink to observe tool-call starts.
+    try testing.expectEqual(@as(usize, 1), collector.count);
+    try testing.expectEqualStrings("probe", collector.lastText());
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

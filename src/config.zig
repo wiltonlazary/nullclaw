@@ -1,5 +1,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const agent_routing = @import("agent_routing.zig");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -467,6 +468,28 @@ pub const Config = struct {
             };
         } else |_| {
             // Config file doesn't exist yet — use defaults
+        }
+
+        if (cfg.tools.tool_customizations_file) |customizations_file| {
+            const customizations_path = if (std_compat.fs.path.isAbsolute(customizations_file))
+                try allocator.dupe(u8, customizations_file)
+            else
+                try std_compat.fs.path.join(allocator, &.{ config_dir, customizations_file });
+            defer allocator.free(customizations_path);
+
+            if (std_compat.fs.openFileAbsolute(customizations_path, .{})) |file| {
+                defer file.close();
+                if (file.readToEndAlloc(allocator, 128 * 1024)) |content| {
+                    defer allocator.free(content);
+                    config_parse.mergeToolCustomizations(&cfg, content) catch |err| {
+                        std.debug.print("Warning: failed to parse tool_customizations_file: {s}\n", .{@errorName(err)});
+                    };
+                } else |err| {
+                    std.debug.print("Warning: failed to read tool_customizations_file: {s}\n", .{@errorName(err)});
+                }
+            } else |_| {
+                // Missing optional customization files keep inline configuration usable.
+            }
         }
 
         // Use workspace_dir_override if set, otherwise use default
@@ -1073,7 +1096,19 @@ pub const Config = struct {
         // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
-            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 30;
+            const has_heartbeat = self.heartbeat.enabled or
+                self.heartbeat.interval_minutes != 30 or
+                self.heartbeat.prompt != null or
+                self.heartbeat.model != null or
+                self.heartbeat.timeout_secs != 120 or
+                self.heartbeat.delivery_mode != null or
+                self.heartbeat.delivery_channel != null or
+                self.heartbeat.delivery_to != null or
+                self.heartbeat.delivery_account_id != null or
+                self.heartbeat.delivery_peer_kind != null or
+                self.heartbeat.delivery_peer_id != null or
+                self.heartbeat.delivery_thread_id != null or
+                !self.heartbeat.delivery_best_effort;
             const has_agents = self.agents.len > 0;
             if (has_model or has_heartbeat or has_agents) {
                 try w.print("  \"agents\": {{\n", .{});
@@ -1110,6 +1145,48 @@ pub const Config = struct {
                     }
                     if (!self.heartbeat.enabled) {
                         try w.print(", \"enabled\": false", .{});
+                    }
+                    if (self.heartbeat.prompt) |prompt| {
+                        try w.print(", \"prompt\": ", .{});
+                        try writeJsonStr(w, prompt);
+                    }
+                    if (self.heartbeat.model) |model| {
+                        try w.print(", \"model\": ", .{});
+                        try writeJsonStr(w, model);
+                    }
+                    if (self.heartbeat.timeout_secs != 120) {
+                        try w.print(", \"timeout_secs\": {d}", .{self.heartbeat.timeout_secs});
+                    }
+                    if (self.heartbeat.delivery_mode) |delivery_mode| {
+                        try w.print(", \"delivery_mode\": ", .{});
+                        try writeJsonStr(w, delivery_mode);
+                    }
+                    if (self.heartbeat.delivery_channel) |delivery_channel| {
+                        try w.print(", \"delivery_channel\": ", .{});
+                        try writeJsonStr(w, delivery_channel);
+                    }
+                    if (self.heartbeat.delivery_to) |delivery_to| {
+                        try w.print(", \"delivery_to\": ", .{});
+                        try writeJsonStr(w, delivery_to);
+                    }
+                    if (self.heartbeat.delivery_account_id) |delivery_account_id| {
+                        try w.print(", \"delivery_account_id\": ", .{});
+                        try writeJsonStr(w, delivery_account_id);
+                    }
+                    if (self.heartbeat.delivery_peer_kind) |delivery_peer_kind| {
+                        try w.print(", \"delivery_peer_kind\": ", .{});
+                        try writeJsonStr(w, delivery_peer_kind);
+                    }
+                    if (self.heartbeat.delivery_peer_id) |delivery_peer_id| {
+                        try w.print(", \"delivery_peer_id\": ", .{});
+                        try writeJsonStr(w, delivery_peer_id);
+                    }
+                    if (self.heartbeat.delivery_thread_id) |delivery_thread_id| {
+                        try w.print(", \"delivery_thread_id\": ", .{});
+                        try writeJsonStr(w, delivery_thread_id);
+                    }
+                    if (!self.heartbeat.delivery_best_effort) {
+                        try w.print(", \"delivery_best_effort\": false", .{});
                     }
                     try w.print("}}\n", .{});
                 }
@@ -1319,6 +1396,14 @@ pub const Config = struct {
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});
         try w.print("    \"path_env_vars\": ", .{});
         try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
+        try w.print(",\n    \"tool_customizations\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
+        try w.print(",\n    \"tool_customizations_file\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations_file, "    ");
+        try w.print(",\n    \"trigger_modifiers\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_modifiers, "    ");
+        try w.print(",\n    \"trigger_punctuation\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.trigger_punctuation, "    ");
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3857,6 +3942,83 @@ test "json parse tools.path_env_vars" {
     allocator.free(cfg.tools.path_env_vars);
 }
 
+fn freeToolCustomizationsForTest(allocator: std.mem.Allocator, items: []const config_types.ToolCustomization) void {
+    for (items) |item| {
+        allocator.free(item.name);
+        if (item.system_prompt) |system_prompt| allocator.free(system_prompt);
+        for (item.triggers) |trigger| allocator.free(trigger);
+        allocator.free(item.triggers);
+    }
+    allocator.free(items);
+}
+
+fn findToolCustomizationForTest(items: []const config_types.ToolCustomization, name: []const u8) ?config_types.ToolCustomization {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.name, name)) return item;
+    }
+    return null;
+}
+
+test "json parse tools.tool_customizations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 300, "enabled": false},
+        \\    {"name": "browser", "triggers": ["open"], "priority": -1},
+        \\    {"system_prompt": "missing name"},
+        \\    "ignored"
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please", "now"],
+        \\  "trigger_punctuation": "!?;"
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", cfg.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", cfg.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.tool_customizations[0].triggers.len);
+    try std.testing.expectEqualStrings("run", cfg.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqualStrings("exec", cfg.tools.tool_customizations[0].triggers[1]);
+    try std.testing.expectEqual(@as(u8, 255), cfg.tools.tool_customizations[0].priority);
+    try std.testing.expect(!cfg.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", cfg.tools.tool_customizations[1].name);
+    try std.testing.expectEqual(@as(u8, 0), cfg.tools.tool_customizations[1].priority);
+    try std.testing.expect(cfg.tools.tool_customizations[1].enabled);
+    try std.testing.expectEqualStrings("tool-customizations.json", cfg.tools.tool_customizations_file.?);
+    try std.testing.expectEqual(@as(usize, 2), cfg.tools.trigger_modifiers.len);
+    try std.testing.expectEqualStrings("please", cfg.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("now", cfg.tools.trigger_modifiers[1]);
+    try std.testing.expectEqualStrings("!?;", cfg.tools.trigger_punctuation);
+}
+
+fn parseToolCustomizationsForAllocationTest(allocator: std.mem.Allocator, json: []const u8) !void {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    freeToolCustomizationsForTest(allocator, cfg.tools.tool_customizations);
+}
+
+test "json parse tools.tool_customizations frees partial allocations on out-of-memory" {
+    const json =
+        \\{"tools": {"tool_customizations": [
+        \\  {"name": "shell", "system_prompt": "Use safe shell", "triggers": ["run", "exec"], "priority": 200, "enabled": false},
+        \\  {"name": "browser", "triggers": ["open", "visit"], "priority": 10}
+        \\]}}
+    ;
+    // Regression: nested tool customization fields must not leak when parsing
+    // fails after partially allocating a customization entry.
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, parseToolCustomizationsForAllocationTest, .{json});
+}
+
 test "save roundtrip preserves tools.path_env_vars" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3891,6 +4053,125 @@ test "save roundtrip preserves tools.path_env_vars" {
     try std.testing.expectEqual(@as(usize, 2), loaded.tools.path_env_vars.len);
     try std.testing.expectEqualStrings("LD_LIBRARY_PATH", loaded.tools.path_env_vars[0]);
     try std.testing.expectEqualStrings("PYTHONHOME", loaded.tools.path_env_vars[1]);
+}
+
+test "save roundtrip preserves tools customization schema" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.tools.tool_customizations = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Use safe shell",
+            .triggers = &.{ "run", "exec" },
+            .priority = 7,
+            .enabled = false,
+        },
+        .{
+            .name = "browser",
+            .triggers = &.{"open"},
+            .priority = 3,
+        },
+    };
+    cfg.tools.tool_customizations_file = "tool-customizations.json";
+    cfg.tools.trigger_modifiers = &.{ "please", "now" };
+    cfg.tools.trigger_punctuation = "!?;";
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", loaded.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Use safe shell", loaded.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("run", loaded.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqual(@as(u8, 7), loaded.tools.tool_customizations[0].priority);
+    try std.testing.expect(!loaded.tools.tool_customizations[0].enabled);
+    try std.testing.expectEqualStrings("browser", loaded.tools.tool_customizations[1].name);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!?;", loaded.tools.trigger_punctuation);
+}
+
+test "load merges relative tool_customizations_file with inline customizations" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tmp_dir = @import("compat").fs.Dir.wrap(tmp.dir);
+    try tmp_dir.makeDir("home");
+
+    const config_json =
+        \\{"tools": {
+        \\  "tool_customizations": [
+        \\    {"name": "shell", "system_prompt": "inline shell", "triggers": ["inline"], "priority": 1}
+        \\  ],
+        \\  "tool_customizations_file": "tool-customizations.json",
+        \\  "trigger_modifiers": ["please"],
+        \\  "trigger_punctuation": "!"
+        \\}}
+    ;
+    const external_json =
+        \\{
+        \\  "shell": {"system_prompt": "external shell", "triggers": ["external"], "priority": 8, "enabled": false},
+        \\  "file_read": {"system_prompt": "external read", "triggers": ["inspect"], "priority": 4}
+        \\}
+    ;
+    try tmp_dir.writeFile(.{ .sub_path = "home/config.json", .data = config_json });
+    try tmp_dir.writeFile(.{ .sub_path = "home/tool-customizations.json", .data = external_json });
+
+    const home = try tmp_dir.realpathAlloc(allocator, "home");
+    defer allocator.free(home);
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(key_z);
+    const home_z = try allocator.dupeZ(u8, home);
+    defer allocator.free(home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, home_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    var loaded = try Config.load(allocator);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), loaded.tools.tool_customizations.len);
+    const shell = findToolCustomizationForTest(loaded.tools.tool_customizations, "shell").?;
+    try std.testing.expectEqualStrings("external shell", shell.system_prompt.?);
+    try std.testing.expectEqualStrings("external", shell.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 8), shell.priority);
+    try std.testing.expect(!shell.enabled);
+
+    const file_read = findToolCustomizationForTest(loaded.tools.tool_customizations, "file_read").?;
+    try std.testing.expectEqualStrings("external read", file_read.system_prompt.?);
+    try std.testing.expectEqualStrings("inspect", file_read.triggers[0]);
+    try std.testing.expectEqual(@as(u8, 4), file_read.priority);
+    try std.testing.expectEqualStrings("tool-customizations.json", loaded.tools.tool_customizations_file.?);
+    try std.testing.expectEqualStrings("please", loaded.tools.trigger_modifiers[0]);
+    try std.testing.expectEqualStrings("!", loaded.tools.trigger_punctuation);
 }
 
 test "json parse autonomy allow_raw_url_chars" {
@@ -5815,6 +6096,104 @@ test "parse agents.defaults.heartbeat disabled" {
     try std.testing.expectEqual(@as(u32, 30), cfg.heartbeat.interval_minutes);
 }
 
+test "parse agents.defaults.heartbeat dispatch settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"heartbeat":{"every":"1m","prompt":"Review tasks","model":"openai/gpt-5.4","timeout_secs":45,"delivery_mode":"on_error","delivery_channel":"telegram","delivery_account_id":"backup","delivery_to":"-100123:thread:77","delivery_peer_kind":"group","delivery_peer_id":"-100123","delivery_thread_id":"77","delivery_best_effort":false}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), cfg.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", cfg.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", cfg.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), cfg.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", cfg.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", cfg.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", cfg.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", cfg.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", cfg.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", cfg.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", cfg.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!cfg.heartbeat.delivery_best_effort);
+}
+
+test "save roundtrip preserves heartbeat dispatch settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.heartbeat = .{
+        .enabled = true,
+        .interval_minutes = 1,
+        .prompt = "Review tasks",
+        .model = "openai/gpt-5.4",
+        .timeout_secs = 45,
+        .delivery_mode = "on_error",
+        .delivery_channel = "telegram",
+        .delivery_account_id = "backup",
+        .delivery_to = "-100123:thread:77",
+        .delivery_peer_kind = "group",
+        .delivery_peer_id = "-100123",
+        .delivery_thread_id = "77",
+        .delivery_best_effort = false,
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"heartbeat\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"every\": \"1m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"prompt\": \"Review tasks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"model\": \"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"timeout_secs\": 45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_mode\": \"on_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_channel\": \"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_account_id\": \"backup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_to\": \"-100123:thread:77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_kind\": \"group\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_id\": \"-100123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_thread_id\": \"77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_best_effort\": false") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expect(loaded.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), loaded.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", loaded.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", loaded.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), loaded.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", loaded.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", loaded.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", loaded.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", loaded.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", loaded.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", loaded.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", loaded.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!loaded.heartbeat.delivery_best_effort);
+}
+
 test "tools.media.audio disabled" {
     const allocator = std.testing.allocator;
     const json =
@@ -6008,7 +6387,7 @@ test "parse irc accounts" {
 test "parse matrix accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true}}}}}
+        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true, "pantalaimon_proxy_url": "http://127.0.0.1:8008"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6024,6 +6403,9 @@ test "parse matrix accounts" {
     try std.testing.expect(mc.require_mention);
     try std.testing.expectEqual(@as(usize, 1), mc.group_allow_from.len);
     try std.testing.expectEqualStrings("@alice:matrix.org", mc.group_allow_from[0]);
+    // Regression: Pantalaimon config must survive JSON parsing before
+    // MatrixChannel can route E2EE traffic through the proxy.
+    try std.testing.expectEqualStrings("http://127.0.0.1:8008", mc.pantalaimon_proxy_url.?);
     allocator.free(mc.account_id);
     allocator.free(mc.homeserver);
     allocator.free(mc.access_token);
@@ -6031,6 +6413,7 @@ test "parse matrix accounts" {
     allocator.free(mc.user_id.?);
     allocator.free(mc.dm_policy);
     allocator.free(mc.group_policy);
+    allocator.free(mc.pantalaimon_proxy_url.?);
     for (mc.group_allow_from) |entry| allocator.free(entry);
     allocator.free(mc.group_allow_from);
     allocator.free(cfg.channels.matrix);

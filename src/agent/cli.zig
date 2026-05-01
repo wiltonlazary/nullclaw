@@ -34,6 +34,7 @@ const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
+const commands = @import("commands.zig");
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
@@ -42,15 +43,11 @@ const CliStreamCtx = struct {
 };
 
 const CliProviderContext = struct {
-    provider: Provider,
-    holder: ?providers.ProviderHolder = null,
+    holder: providers.ProviderHolder,
     owned_api_key: ?[]u8 = null,
 
     fn deinit(self: *CliProviderContext, allocator: std.mem.Allocator) void {
-        if (self.holder) |*holder| {
-            holder.deinit();
-            self.holder = null;
-        }
+        self.holder.deinit();
         if (self.owned_api_key) |api_key| {
             allocator.free(api_key);
             self.owned_api_key = null;
@@ -169,6 +166,8 @@ const ParsedAgentArgs = struct {
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
     agent_name: ?[]const u8 = null,
+    workspace_override: ?[]const u8 = null,
+    skill_name: ?[]const u8 = null,
     verbose: bool = false,
 };
 
@@ -208,6 +207,14 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.agent_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--workspace")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.workspace_override = args[i];
+        } else if (std.mem.eql(u8, arg, "--skill")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.skill_name = args[i];
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             parsed.verbose = true;
         }
@@ -251,7 +258,7 @@ fn resolveProfileProvider(
         break :blk owned_api_key;
     };
 
-    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+    const holder = providers.ProviderHolder.fromConfigWithApiMode(
         allocator,
         profile.provider,
         provider_api_key,
@@ -264,10 +271,17 @@ fn resolveProfileProvider(
         cfg.getProviderExtraBodyParams(profile.provider),
     );
     return .{
-        .provider = holder.provider(),
         .holder = holder,
         .owned_api_key = owned_api_key,
     };
+}
+
+/// Resolve the provider only after any holder-backed override reaches stable storage.
+fn activeCliProvider(
+    provider_ctx: ?*CliProviderContext,
+    runtime_provider: ?*providers.runtime_bundle.RuntimeProviderBundle,
+) Provider {
+    return if (provider_ctx) |ctx| ctx.holder.provider() else runtime_provider.?.provider();
 }
 
 /// Run the agent in single-message or interactive REPL mode.
@@ -331,6 +345,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             selected_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
             cfg.workspace_dir = selected_workspace_dir.?;
         }
+    }
+    if (parsed_args.workspace_override) |workspace| {
+        cfg.workspace_dir = workspace;
     }
 
     var agent_memory_session_id: ?[]u8 = null;
@@ -477,7 +494,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         tools_mod.bindMemoryRuntime(tools, rt);
     }
 
-    const provider_i: Provider = if (provider_ctx) |ctx| ctx.provider else runtime_provider.?.provider();
+    const provider_i = activeCliProvider(
+        if (provider_ctx) |*ctx| ctx else null,
+        if (runtime_provider) |*bundle| bundle else null,
+    );
 
     const supports_streaming = provider_i.supportsStreaming();
 
@@ -504,6 +524,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.memory_session_id = sid;
         } else if (agent_memory_session_id) |memory_session_id| {
             agent.memory_session_id = memory_session_id;
+        }
+        if (parsed_args.skill_name) |sname| {
+            _ = try commands.activateSkillByName(&agent, sname);
         }
         defer agent.deinit();
 
@@ -615,6 +638,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.memory_session_id = sid;
     } else if (agent_memory_session_id) |memory_session_id| {
         agent.memory_session_id = memory_session_id;
+    }
+    if (parsed_args.skill_name) |sname| {
+        _ = try commands.activateSkillByName(&agent, sname);
     }
     defer agent.deinit();
 
@@ -937,6 +963,42 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
 }
 
+test "activeCliProvider uses returned holder storage for named agents" {
+    var cfg = Config{
+        .allocator = std.testing.allocator,
+        .workspace_dir = "/tmp/nullclaw-cli-test",
+        .config_path = "/tmp/nullclaw-cli-test/config.json",
+        .providers = &.{
+            .{
+                .name = "custom:dmr",
+                .base_url = "http://127.0.0.1:8080/v1",
+            },
+        },
+    };
+    const profile = config_types.NamedAgentConfig{
+        .name = "sub",
+        .provider = "custom:dmr",
+        .model = "smollm2",
+        .api_key = "placeholder",
+    };
+
+    // Regression: issue #811 requires the runtime Provider to be derived from
+    // the returned holder storage, not from resolveProfileProvider's stack frame.
+    var provider_ctx = try resolveProfileProvider(std.testing.allocator, &cfg, profile);
+    defer provider_ctx.deinit(std.testing.allocator);
+
+    const provider = activeCliProvider(&provider_ctx, null);
+    const holder_provider = provider_ctx.holder.provider();
+    try std.testing.expectEqual(@intFromPtr(holder_provider.ptr), @intFromPtr(provider.ptr));
+    try std.testing.expectEqual(@intFromPtr(holder_provider.vtable), @intFromPtr(provider.vtable));
+    switch (provider_ctx.holder) {
+        .compatible => |*compatible_provider| {
+            try std.testing.expectEqual(@intFromPtr(compatible_provider), @intFromPtr(provider.ptr));
+        },
+        else => unreachable,
+    }
+}
+
 test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
     try std.testing.expect(shouldPrintTurnResponse(true, false));
     try std.testing.expect(shouldPrintTurnResponse(false, false));
@@ -1003,6 +1065,42 @@ test "parseAgentArgs returns missing value for --agent" {
     const args = [_][]const u8{"--agent"};
     switch (parseAgentArgs(&args)) {
         .missing_value => |value| try std.testing.expectEqualStrings("--agent", value),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs parses --workspace" {
+    const args = [_][]const u8{ "--workspace", "/custom/ws", "-m", "hi" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("/custom/ws", parsed.workspace_override.?);
+    try std.testing.expectEqualStrings("hi", parsed.message_arg.?);
+}
+
+test "parseAgentArgs returns missing value for --workspace" {
+    const args = [_][]const u8{"--workspace"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("--workspace", value),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs parses --skill" {
+    const args = [_][]const u8{ "--skill", "news-digest", "-m", "go" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("news-digest", parsed.skill_name.?);
+    try std.testing.expectEqualStrings("go", parsed.message_arg.?);
+}
+
+test "parseAgentArgs returns missing value for --skill" {
+    const args = [_][]const u8{"--skill"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("--skill", value),
         else => unreachable,
     }
 }

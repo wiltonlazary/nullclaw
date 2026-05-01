@@ -9,6 +9,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const build_options = @import("build_options");
+const http_util = @import("../../http_util.zig");
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
 const VoyageEmbedding = @import("embeddings_voyage.zig").VoyageEmbedding;
@@ -176,13 +177,13 @@ pub const OpenAiEmbedding = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self_.api_key});
         defer allocator.free(auth_header);
 
-        var client = std.http.Client{ .allocator = allocator, .io = std_compat.io() };
+        var client = try http_util.ProxyHttpClient.init(allocator);
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
 
-        const result = client.fetch(.{
+        const result = client.client.fetch(.{
             .location = .{ .url = url },
             .method = .POST,
             .payload = body_buf.items,

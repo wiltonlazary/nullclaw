@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
+const text_helpers = @import("text_helpers.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -59,25 +60,6 @@ fn parseStatusCodeValue(value: std.json.Value) ?u16 {
     };
 }
 
-fn sliceEqlAsciiFold(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
-}
-
-fn containsAsciiFold(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len == 0) return true;
-    if (haystack.len < needle.len) return false;
-
-    var i: usize = 0;
-    while (i + needle.len <= haystack.len) : (i += 1) {
-        if (sliceEqlAsciiFold(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
-
 fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     if (root_obj.get("error")) |err_value| {
         if (err_value == .object) {
@@ -125,11 +107,11 @@ fn isResponsesFallbackMessage(message: []const u8) bool {
     const trimmed = std.mem.trim(u8, message, " \t\r\n");
     if (trimmed.len == 0) return false;
 
-    return sliceEqlAsciiFold(trimmed, "not found") or
-        sliceEqlAsciiFold(trimmed, "404 not found") or
-        containsAsciiFold(trimmed, "unknown endpoint") or
-        containsAsciiFold(trimmed, "endpoint not found") or
-        containsAsciiFold(trimmed, "/chat/completions");
+    return text_helpers.sliceEqlAsciiFold(trimmed, "not found") or
+        text_helpers.sliceEqlAsciiFold(trimmed, "404 not found") or
+        text_helpers.containsAsciiFold(trimmed, "unknown endpoint") or
+        text_helpers.containsAsciiFold(trimmed, "endpoint not found") or
+        text_helpers.containsAsciiFold(trimmed, "/chat/completions");
 }
 
 fn isPlainTextResponsesFallbackMessage(body: []const u8) bool {
@@ -138,11 +120,11 @@ fn isPlainTextResponsesFallbackMessage(body: []const u8) bool {
 
     // Some compatible gateways return a plain-text 404 instead of a JSON error
     // envelope when /chat/completions is missing.
-    return containsAsciiFold(trimmed, "/chat/completions") and
-        (containsAsciiFold(trimmed, "404") or
-            containsAsciiFold(trimmed, "not found") or
-            containsAsciiFold(trimmed, "unknown endpoint") or
-            containsAsciiFold(trimmed, "endpoint not found"));
+    return text_helpers.containsAsciiFold(trimmed, "/chat/completions") and
+        (text_helpers.containsAsciiFold(trimmed, "404") or
+            text_helpers.containsAsciiFold(trimmed, "not found") or
+            text_helpers.containsAsciiFold(trimmed, "unknown endpoint") or
+            text_helpers.containsAsciiFold(trimmed, "endpoint not found"));
 }
 
 fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) bool {

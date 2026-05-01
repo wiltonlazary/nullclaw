@@ -32,6 +32,7 @@ const fs_compat = @import("fs_compat.zig");
 const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
+const weixin = @import("channels/weixin.zig");
 const matrix = @import("channels/matrix.zig");
 const max_mod = @import("channels/max.zig");
 const channels_mod = @import("channels/root.zig");
@@ -170,7 +171,8 @@ fn logAgentProcessingError(
 
 fn defaultAgentErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.CurlTimeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
         error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -728,6 +730,71 @@ fn sendTelegramStartGreeting(
     };
 }
 
+fn telegramConversationContext(
+    account_id: []const u8,
+    sender: []const u8,
+    is_group: bool,
+) ?ConversationContext {
+    return buildConversationContext(.{
+        .channel = "telegram",
+        .account_id = account_id,
+        .delivery_chat_id = sender,
+        .peer_id = sender,
+        .is_group = is_group,
+        .group_id = if (is_group) sender else null,
+    });
+}
+
+fn handleTelegramInteractiveCallback(
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+    session_key: []const u8,
+    content: []const u8,
+    sender: []const u8,
+    message_id: i64,
+    is_group: bool,
+    message_sender_id: []const u8,
+) bool {
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+
+    var response_owned = false;
+    const response = blk: {
+        if (control_plane.parseSlashCommand(content) != null) {
+            const maybe_local = runtime.session_mgr.handleLocalSlashCommand(session_key, content, conversation_context) catch |err| {
+                log.err("failed to handle telegram callback slash command locally: {}", .{err});
+                response_owned = true;
+                break :blk allocator.dupe(u8, "Failed to update interactive menu.") catch return true;
+            };
+            if (maybe_local) |reply| {
+                response_owned = true;
+                break :blk reply;
+            }
+            return false;
+        }
+
+        const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+            log.err("failed to process telegram callback interaction: {}", .{err});
+            response_owned = true;
+            break :blk allocator.dupe(u8, defaultAgentErrorMessage(err)) catch return true;
+        };
+        response_owned = true;
+        break :blk model_reply;
+    };
+    defer if (response_owned) allocator.free(response);
+
+    if (shouldSuppressGroupReply(is_group, response)) return true;
+
+    tg_ptr.editAssistantMessage(sender, message_sender_id, is_group, message_id, response) catch |err| {
+        log.warn("failed to edit telegram callback response in place: {}", .{err});
+        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, response, message_id) catch |send_err| {
+            log.err("failed to send telegram callback fallback reply: {}", .{send_err});
+        };
+        return true;
+    };
+    return true;
+}
+
 fn handleTelegramBuiltinCommand(
     allocator: std.mem.Allocator,
     session_mgr: *session_mod.SessionManager,
@@ -900,14 +967,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = buildConversationContext(.{
-        .channel = "telegram",
-        .account_id = tg_ptr.account_id,
-        .delivery_chat_id = sender,
-        .peer_id = sender,
-        .is_group = is_group,
-        .group_id = if (is_group) sender else null,
-    });
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -917,7 +977,7 @@ fn processTelegramMessage(
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
-    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink) catch |err| {
+    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
         const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
@@ -1456,6 +1516,38 @@ pub fn runTelegramLoop(
             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
+            if (msg.is_interaction_callback and msg.message_id != null) {
+                const session_key = resolveTelegramSessionKey(
+                    allocator,
+                    &runtime.session_mgr,
+                    config,
+                    tg_ptr.account_id,
+                    msg.sender,
+                    msg.is_group,
+                ) catch |err| {
+                    log.err("failed to resolve telegram session key for interactive skill menu: {}", .{err});
+                    tg_ptr.sendMessageWithReply(msg.sender, "Failed to resolve session for this skill menu.", reply_to_id) catch |send_err| {
+                        log.err("failed to send telegram skill-menu session error reply: {}", .{send_err});
+                    };
+                    continue;
+                };
+                defer allocator.free(session_key);
+
+                if (handleTelegramInteractiveCallback(
+                    allocator,
+                    runtime,
+                    tg_ptr,
+                    session_key,
+                    msg.content,
+                    msg.sender,
+                    msg.message_id.?,
+                    msg.is_group,
+                    msg.id,
+                )) {
+                    continue;
+                }
+            }
+
             if (handleTelegramBuiltinCommand(
                 allocator,
                 &runtime.session_mgr,
@@ -1700,6 +1792,26 @@ pub const SignalLoopState = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// WeixinLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const WeixinLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: Atomic(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: Atomic(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() WeixinLoopState {
+        return .{
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
+        };
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // runSignalLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1824,6 +1936,104 @@ pub fn runSignalLoop(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// runWeixinLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+pub fn runWeixinLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *WeixinLoopState,
+    wx_ptr: *weixin.WeixinChannel,
+) void {
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = wx_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Weixin poll error: {}", .{err});
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            continue;
+        };
+
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            const reply_target = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(
+                runtime.tools,
+                "weixin",
+                wx_ptr.config.account_id,
+                reply_target,
+                .direct,
+                msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
+
+            var key_buf: [192]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "weixin",
+                    .account_id = wx_ptr.config.account_id,
+                    .peer = .{
+                        .kind = .direct,
+                        .id = msg.sender,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "weixin:{s}:{s}", .{ wx_ptr.config.account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            const conversation_context = buildConversationContext(.{
+                .channel = "weixin",
+                .account_id = wx_ptr.config.account_id,
+                .sender_id = msg.sender,
+                .delivery_chat_id = reply_target,
+                .peer_id = msg.sender,
+                .is_group = false,
+            });
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+                logAgentProcessingError(allocator, "Weixin agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                wx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send weixin error reply: {}", .{send_err});
+                continue;
+            };
+            defer allocator.free(reply);
+
+            wx_ptr.sendMessage(reply_target, reply) catch |err| {
+                log.warn("Weixin send error: {}", .{err});
+            };
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("weixin");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MatrixLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1866,6 +2076,7 @@ pub const MaxLoopState = struct {
 pub const PollingState = union(enum) {
     telegram: *TelegramLoopState,
     signal: *SignalLoopState,
+    weixin: *WeixinLoopState,
     matrix: *MatrixLoopState,
     max: *MaxLoopState,
 };
@@ -1920,6 +2131,30 @@ pub fn spawnSignalPolling(
     return .{
         .thread = thread,
         .state = .{ .signal = sg_ls },
+    };
+}
+
+pub fn spawnWeixinPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const wx_ls = try allocator.create(WeixinLoopState);
+    errdefer allocator.destroy(wx_ls);
+    wx_ls.* = WeixinLoopState.init();
+
+    const wx_ptr: *weixin.WeixinChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        runWeixinLoop,
+        .{ allocator, config, runtime, wx_ls, wx_ptr },
+    );
+    wx_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .weixin = wx_ls },
     };
 }
 
@@ -2174,7 +2409,7 @@ pub fn runMaxLoop(
             };
             const sink = mx_ptr.makeSink(&stream_ctx);
 
-            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink) catch |err| {
+            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
@@ -2331,6 +2566,29 @@ test "SignalLoopState stop_requested toggle" {
 
 test "SignalLoopState last_activity update" {
     var state = SignalLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "WeixinLoopState init defaults" {
+    const state = WeixinLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "WeixinLoopState stop_requested toggle" {
+    var state = WeixinLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "WeixinLoopState last_activity update" {
+    var state = WeixinLoopState.init();
     const before = state.last_activity.load(.acquire);
     std_compat.thread.sleep(10 * std.time.ns_per_ms);
     state.last_activity.store(std_compat.time.timestamp(), .release);
@@ -2548,6 +2806,30 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
     try std.testing.expect(std.mem.indexOf(u8, reply, "Exact binding: coder") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Inherited peer binding: reviewer") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: peer") != null);
+}
+
+test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
+    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+
+    // Regression: Telegram button callbacks must keep the outbound delivery target,
+    // or scheduled/tool-driven follow-ups can route to the session peer only.
+    try std.testing.expectEqualStrings("telegram", context.channel.?);
+    try std.testing.expectEqualStrings("main", context.account_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
+    try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
+test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {
+    try std.testing.expectEqualStrings(
+        "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        defaultAgentErrorMessage(error.CurlTimeout),
+    );
+    try std.testing.expectEqualStrings(
+        "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        defaultAgentErrorMessage(error.CurlConnectError),
+    );
 }
 
 test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {

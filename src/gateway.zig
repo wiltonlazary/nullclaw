@@ -6,7 +6,7 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /status, /doctor, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -15,7 +15,9 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const daemon = @import("daemon.zig");
+const doctor_mod = @import("doctor.zig");
 const health = @import("health.zig");
+const status_mod = @import("status.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -556,12 +558,7 @@ fn publishToBus(
 
 /// Check if all registered health components are OK.
 fn isHealthOk() bool {
-    const snap = health.snapshot();
-    var iter = snap.components.iterator();
-    while (iter.next()) |entry| {
-        if (!std.mem.eql(u8, entry.value_ptr.status, "ok")) return false;
-    }
-    return true;
+    return health.allComponentsOk();
 }
 
 /// Readiness response — encapsulates HTTP status and body for /ready.
@@ -583,20 +580,15 @@ pub fn handleReady(allocator: std.mem.Allocator) ReadyResponse {
             .allocated = false,
         };
     };
-    // formatJson must be called before freeing the checks slice
+    defer readiness.deinit(allocator);
+
     const json_body = readiness.formatJson(allocator) catch {
-        if (readiness.checks.len > 0) {
-            allocator.free(readiness.checks);
-        }
         return .{
             .http_status = "500 Internal Server Error",
             .body = "{\"status\":\"not_ready\",\"checks\":[]}",
             .allocated = false,
         };
     };
-    if (readiness.checks.len > 0) {
-        allocator.free(readiness.checks);
-    }
     return .{
         .http_status = if (readiness.status == .ready) "200 OK" else "503 Service Unavailable",
         .body = json_body,
@@ -709,6 +701,13 @@ pub fn revokeAuthorizedBearerToken(pairing_guard: ?*PairingGuard, bearer_token: 
     const token = bearer_token orelse return false;
     if (!guard.isAuthenticated(token)) return false;
     return guard.revokeToken(token);
+}
+
+fn isAdminRouteAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[]const u8) bool {
+    const guard = pairing_guard orelse return true;
+    if (!guard.requirePairing()) return true;
+    if (!guard.hasPairedTokens()) return false;
+    return isWebhookAuthorized(pairing_guard, bearer_token);
 }
 
 /// Format the /pair success payload. Returns null when buffer is too small.
@@ -4960,7 +4959,7 @@ pub fn clearSharedScheduler() void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, GET /status, GET /doctor, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -5252,10 +5251,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const target = parts.next() orelse continue;
 
         // Simple routing — control endpoints + descriptor-driven channel webhooks.
-        const ControlRoute = enum { health, ready, webhook, pair, logout };
+        const ControlRoute = enum { health, ready, status, doctor, webhook, pair, logout };
         const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
+            .{ "/status", .status },
+            .{ "/doctor", .doctor },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
             .{ "/logout", .logout },
@@ -5276,15 +5277,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             const auth_header = extractHeader(raw, "Authorization");
             const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
             const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
-            const cron_authorized = if (pairing_guard) |g|
-                if (!g.requirePairing())
-                    true
-                else if (!g.hasPairedTokens())
-                    false // bootstrap phase: deny, CLI falls back to disk
-                else
-                    isWebhookAuthorized(pairing_guard, bearer)
-            else
-                true;
+            const cron_authorized = isAdminRouteAuthorized(pairing_guard, bearer);
             if (!cron_authorized) {
                 response_status = "401 Unauthorized";
                 response_body = "{\"error\":\"unauthorized\"}";
@@ -5411,6 +5404,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
                     continue;
                 };
+                defer readiness.deinit(req_allocator);
                 const json_body = readiness.formatJson(req_allocator) catch {
                     response_status = "500 Internal Server Error";
                     response_body = "{\"status\":\"not_ready\",\"checks\":[]}";
@@ -5420,6 +5414,36 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 if (readiness.status != .ready) {
                     response_status = "503 Service Unavailable";
                 }
+            },
+            .status => {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isAdminRouteAuthorized(pairing_guard, bearer)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                    continue;
+                }
+                response_body = status_mod.buildRuntimeStatusJson(req_allocator) catch {
+                    response_status = "500 Internal Server Error";
+                    response_body = "{\"error\":\"status_unavailable\"}";
+                    continue;
+                };
+            },
+            .doctor => {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isAdminRouteAuthorized(pairing_guard, bearer)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                    continue;
+                }
+                response_body = doctor_mod.buildDoctorJson(req_allocator) catch {
+                    response_status = "500 Internal Server Error";
+                    response_body = "{\"error\":\"doctor_unavailable\"}";
+                    continue;
+                };
             },
             .webhook => {
                 if (!is_post) {
@@ -5560,19 +5584,16 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 // ── Tests ────────────────────────────────────────────────────────
 
 test "cron auth matrix: no pairing guard allows all" {
-    // When pairing is not configured (guard is null), /cron is open.
+    // When pairing is not configured, admin routes stay open.
     try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
-    // Simulate the cron_authorized logic with null guard
-    const cron_authorized = true; // null guard → allow
-    try std.testing.expect(cron_authorized);
+    try std.testing.expect(isAdminRouteAuthorized(null, null));
 }
 
 test "cron auth matrix: pairing disabled allows all" {
     var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
     defer guard.deinit();
     try std.testing.expect(!guard.requirePairing());
-    // cron_authorized = !requirePairing() → true
-    try std.testing.expect(!guard.requirePairing());
+    try std.testing.expect(isAdminRouteAuthorized(&guard, null));
 }
 
 test "cron auth matrix: bootstrap phase denies all" {
@@ -5581,9 +5602,7 @@ test "cron auth matrix: bootstrap phase denies all" {
     defer guard.deinit();
     try std.testing.expect(guard.requirePairing());
     try std.testing.expect(!guard.hasPairedTokens());
-    // cron_authorized = hasPairedTokens() is false → false (deny)
-    const cron_authorized = guard.hasPairedTokens();
-    try std.testing.expect(!cron_authorized);
+    try std.testing.expect(!isAdminRouteAuthorized(&guard, null));
 }
 
 test "cron auth matrix: paired phase requires valid token" {
@@ -5592,12 +5611,9 @@ test "cron auth matrix: paired phase requires valid token" {
     defer guard.deinit();
     try std.testing.expect(guard.requirePairing());
     try std.testing.expect(guard.hasPairedTokens());
-    // Valid token → authorized
-    try std.testing.expect(guard.isAuthenticated("zc_secret_token"));
-    // Invalid token → denied
-    try std.testing.expect(!guard.isAuthenticated("wrong_token"));
-    // No token → denied
-    try std.testing.expect(!guard.isAuthenticated(""));
+    try std.testing.expect(isAdminRouteAuthorized(&guard, "zc_secret_token"));
+    try std.testing.expect(!isAdminRouteAuthorized(&guard, "wrong_token"));
+    try std.testing.expect(!isAdminRouteAuthorized(&guard, null));
 }
 
 test "shared scheduler registration sets and clears global pointer" {

@@ -8,10 +8,12 @@
 
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
+const agent_runner = @import("agent_runner.zig");
 const bus_mod = @import("bus.zig");
 const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
@@ -40,6 +42,11 @@ const log = std.log.scoped(.daemon);
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// Default heartbeat prompt sent to the agent when HEARTBEAT.md has tasks.
+const DEFAULT_HEARTBEAT_PROMPT =
+    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. " ++
+    "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
 
 /// Daemon heartbeat initializes memory/bootstrap runtime state before it
 /// settles into its periodic loop, so it needs the session-turn budget.
@@ -176,6 +183,37 @@ pub fn isShutdownRequested() bool {
     return shutdown_requested.load(.acquire);
 }
 
+fn heartbeatDeliveryConfig(config: *const Config) ?cron.DeliveryConfig {
+    if (config.heartbeat.delivery_mode == null and
+        config.heartbeat.delivery_channel == null and
+        config.heartbeat.delivery_to == null and
+        config.heartbeat.delivery_account_id == null and
+        config.heartbeat.delivery_peer_kind == null and
+        config.heartbeat.delivery_peer_id == null and
+        config.heartbeat.delivery_thread_id == null and
+        config.heartbeat.delivery_best_effort)
+    {
+        return null;
+    }
+
+    return cron.enrichDeliveryRouting(.{
+        .mode = if (config.heartbeat.delivery_mode) |raw|
+            cron.DeliveryMode.parse(raw)
+        else
+            .none,
+        .channel = config.heartbeat.delivery_channel,
+        .account_id = config.heartbeat.delivery_account_id,
+        .to = config.heartbeat.delivery_to,
+        .peer_kind = if (config.heartbeat.delivery_peer_kind) |raw|
+            channel_adapters.parsePeerKind(raw)
+        else
+            null,
+        .peer_id = config.heartbeat.delivery_peer_id,
+        .thread_id = config.heartbeat.delivery_thread_id,
+        .best_effort = config.heartbeat.delivery_best_effort,
+    });
+}
+
 fn recordGatewayFailure(err: anyerror, state: *DaemonState) void {
     requestShutdown();
     state.markError("gateway", @errorName(err));
@@ -206,7 +244,7 @@ fn gatewayThread(allocator: std.mem.Allocator, config: *const Config, host: []co
 
 /// Heartbeat thread — periodically writes state file, checks health, and
 /// runs HEARTBEAT.md polling ticks on the configured heartbeat interval.
-fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState) void {
+fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
@@ -247,7 +285,31 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
                 continue;
             };
             switch (tick_result.outcome) {
-                .processed => log.info("heartbeat tick loaded {d} task(s) from HEARTBEAT.md", .{tick_result.task_count}),
+                .processed => {
+                    log.info("heartbeat tick loaded {d} task(s), dispatching agent", .{tick_result.task_count});
+                    if (builtin.is_test) {
+                        log.info("heartbeat: test mode, skipping agent dispatch", .{});
+                    } else {
+                        const delivery = heartbeatDeliveryConfig(config);
+                        const prompt = config.heartbeat.prompt orelse DEFAULT_HEARTBEAT_PROMPT;
+                        const result = agent_runner.run(allocator, config.workspace_dir, prompt, config.heartbeat.model, config.heartbeat.timeout_secs) catch |err| {
+                            log.warn("heartbeat agent dispatch failed: {s}", .{@errorName(err)});
+                            if (delivery) |cfg| {
+                                const failure_output = std.fmt.allocPrint(allocator, "heartbeat agent dispatch failed: {s}", .{@errorName(err)}) catch null;
+                                defer if (failure_output) |msg| allocator.free(msg);
+                                _ = cron.deliverResult(allocator, cfg, failure_output orelse "heartbeat agent dispatch failed", false, event_bus) catch {};
+                            }
+                            next_heartbeat_tick_at_ns = now_ns + heartbeat_interval_ns;
+                            std_compat.thread.sleep(STATUS_FLUSH_SECONDS * std.time.ns_per_s);
+                            continue;
+                        };
+                        defer allocator.free(result.output);
+                        log.info("heartbeat agent completed (success={}, output_len={})", .{ result.success, result.output.len });
+                        if (delivery) |cfg| {
+                            _ = cron.deliverResult(allocator, cfg, result.output, result.success, event_bus) catch {};
+                        }
+                    }
+                },
                 .skipped_empty_file => log.debug("heartbeat tick skipped: HEARTBEAT.md has no actionable content", .{}),
                 .skipped_missing_file => log.debug("heartbeat tick skipped: HEARTBEAT.md is missing", .{}),
             }
@@ -1208,6 +1270,7 @@ fn inboundDispatcherThread(
                 msg.content,
                 conversation_context,
                 stream_sink,
+                null,
             ) catch |err| {
                 log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1413,7 +1476,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state, &event_bus })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -2819,9 +2882,39 @@ test "scheduler backoff progression" {
 }
 
 test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
     const cmd_runtime = "echo merge_runtime_keep_7d1c";
     const cmd_external = "echo merge_external_add_9a42";
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
@@ -2868,8 +2961,64 @@ test "daemon heartbeat thread stack matches session turn budget" {
     try std.testing.expectEqual(thread_stacks.SESSION_TURN_STACK_SIZE, HEARTBEAT_THREAD_STACK_SIZE);
 }
 
+test "heartbeatDeliveryConfig enriches routing" {
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .heartbeat = .{
+            .delivery_mode = "always",
+            .delivery_channel = "telegram",
+            .delivery_account_id = "backup",
+            .delivery_to = "-100123:thread:77",
+            .delivery_thread_id = "77",
+            .delivery_best_effort = false,
+        },
+    };
+
+    const delivery = heartbeatDeliveryConfig(&config) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(cron.DeliveryMode.always, delivery.mode);
+    try std.testing.expectEqualStrings("telegram", delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", delivery.account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", delivery.peer_id.?);
+    try std.testing.expectEqualStrings("77", delivery.thread_id.?);
+    try std.testing.expect(!delivery.best_effort);
+}
+
 test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
     const allocator = std.testing.allocator;
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();

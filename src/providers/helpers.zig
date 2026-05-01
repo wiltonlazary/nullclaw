@@ -160,13 +160,13 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body_str,
@@ -195,13 +195,13 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client = try http_util.ProxyHttpClient.init(allocator);
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
 
-    const result = try client.fetch(.{
+    const result = try client.client.fetch(.{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body_str,
