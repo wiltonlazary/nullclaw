@@ -17,7 +17,7 @@ const agent_mod = @import("agent/root.zig");
 
 pub const QueueMode = agent_mod.Agent.QueueMode;
 
-/// Lock-free snapshot of the state needed to make a routing decision.
+/// Snapshot of the state needed to make a routing decision.
 /// Obtained via SessionManager.routeInput().
 pub const RouteInput = struct {
     /// True when agent.turn() is currently executing for this session.

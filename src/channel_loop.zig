@@ -127,6 +127,21 @@ fn setScheduleToolContext(
     }
 }
 
+fn routeInboundForActiveTurn(runtime: *ChannelRuntime, session_key: []const u8, content: []const u8) bool {
+    switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
+        .inject, .replace_injection => {
+            runtime.session_mgr.injectMidTurn(session_key, content) catch |err|
+                log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
+            return true;
+        },
+        .drop => {
+            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
+            return true;
+        },
+        .process, .queue => return false,
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Parallel Message Processing
 // ════════════════════════════════════════════════════════════════════════════
@@ -774,6 +789,8 @@ fn handleTelegramInteractiveCallback(
             return false;
         }
 
+        if (routeInboundForActiveTurn(runtime, session_key, content)) return true;
+
         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
             log.err("failed to process telegram callback interaction: {}", .{err});
             response_owned = true;
@@ -977,18 +994,7 @@ fn processTelegramMessage(
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
-    switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
-        .inject, .replace_injection => {
-            runtime.session_mgr.injectMidTurn(session_key, content) catch |err|
-                log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-            return;
-        },
-        .drop => {
-            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
-            return;
-        },
-        .process, .queue => {},
-    }
+    if (routeInboundForActiveTurn(runtime, session_key, content)) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
@@ -1895,11 +1901,6 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
-            const typing_target = msg.reply_target;
-            if (typing_target) |target| sg_ptr.startTyping(target) catch {};
-            defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
-
-            // Build conversation context for Signal
             const conversation_context = buildConversationContext(.{
                 .channel = "signal",
                 .account_id = sg_ptr.account_id,
@@ -1910,6 +1911,12 @@ pub fn runSignalLoop(
                 .group_id = msg.group_id,
                 .is_group = msg.is_group,
             });
+
+            if (routeInboundForActiveTurn(runtime, session_key, msg.content)) continue;
+
+            const typing_target = msg.reply_target;
+            if (typing_target) |target| sg_ptr.startTyping(target) catch {};
+            defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 logAgentProcessingError(allocator, "Signal agent error", err);
@@ -2014,6 +2021,8 @@ pub fn runWeixinLoop(
                 .peer_id = msg.sender,
                 .is_group = false,
             });
+
+            if (routeInboundForActiveTurn(runtime, session_key, msg.content)) continue;
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 logAgentProcessingError(allocator, "Weixin agent error", err);
@@ -2259,18 +2268,20 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
-            const typing_target = msg.reply_target orelse msg.sender;
-            mx_ptr.startTyping(typing_target) catch {};
-            defer mx_ptr.stopTyping(typing_target) catch {};
-
             const conversation_context = buildConversationContext(.{
                 .channel = "matrix",
                 .account_id = mx_ptr.account_id,
-                .delivery_chat_id = typing_target,
+                .delivery_chat_id = msg.reply_target orelse msg.sender,
                 .peer_id = if (msg.is_group) room_peer_id else msg.sender,
                 .is_group = msg.is_group,
                 .group_id = if (msg.is_group) room_peer_id else null,
             });
+
+            if (routeInboundForActiveTurn(runtime, session_key, msg.content)) continue;
+
+            const typing_target = msg.reply_target orelse msg.sender;
+            mx_ptr.startTyping(typing_target) catch {};
+            defer mx_ptr.stopTyping(typing_target) catch {};
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 logAgentProcessingError(allocator, "Matrix agent error", err);
@@ -2405,18 +2416,7 @@ pub fn runMaxLoop(
                 break :blk route.session_key;
             };
 
-            switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
-                .inject, .replace_injection => {
-                    runtime.session_mgr.injectMidTurn(session_key, msg.content) catch |err|
-                        log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                    continue;
-                },
-                .drop => {
-                    log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
-                    continue;
-                },
-                .process, .queue => {},
-            }
+            if (routeInboundForActiveTurn(runtime, session_key, msg.content)) continue;
 
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
