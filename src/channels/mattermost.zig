@@ -20,6 +20,7 @@ fn buildTypingRequestBody(
     var body: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body.deinit(allocator);
     var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
     const bw = &body_writer.writer;
     try bw.writeAll("{\"channel_id\":");
     try root.appendJsonStringW(bw, channel_id);
@@ -43,6 +44,7 @@ fn buildPostRequestBody(
     var body: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body.deinit(allocator);
     var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
     const bw = &body_writer.writer;
     try bw.writeAll("{\"channel_id\":");
     try root.appendJsonStringW(bw, channel_id);
@@ -67,6 +69,7 @@ fn buildDirectChannelRequestBody(
     var body: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body.deinit(allocator);
     var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body);
+    errdefer body_writer.deinit();
     const bw = &body_writer.writer;
     try bw.writeByte('[');
     try root.appendJsonStringW(bw, bot_id);
